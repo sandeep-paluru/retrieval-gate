@@ -1,0 +1,10 @@
+{"id": "q01", "query": "how do I reset my password", "relevant": ["d01"]}
+{"id": "q02", "query": "enable two factor authentication", "relevant": ["d02"]}
+{"id": "q03", "query": "where can I download a monthly invoice", "relevant": ["d03"]}
+{"id": "q04", "query": "how long do refunds take", "relevant": ["d04"]}
+{"id": "q05", "query": "create an api key", "relevant": ["d05"]}
+{"id": "q06", "query": "what does http 429 mean", "relevant": ["d06"]}
+{"id": "q07", "query": "set up saml single sign on", "relevant": ["d07"]}
+{"id": "q08", "query": "export account data as csv", "relevant": ["d08"]}
+{"id": "q09", "query": "invite a teammate and assign a role", "relevant": ["d09"]}
+{"id": "q10", "query": "webhook when an invoice is paid", "relevant": {"d10": 2, "d03": 1}}
