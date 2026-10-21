@@ -12,6 +12,8 @@ from retrieval_gate.models import Case
 from retrieval_gate.retriever import call_retriever
 
 _MISS_LIMIT = 10
+_QUERY_LIMIT = 60
+_DELTA_EPSILON = 1e-9
 
 
 def build_report(
@@ -351,6 +353,376 @@ def _markdown_table(rows: list[list[str]]) -> str:
     ]
     lines.extend("| " + " | ".join(row) + " |" for row in rows)
     return "\n".join(lines)
+
+
+def case_diff(baseline: dict, current: dict) -> dict:
+    """Match cases by id and list the ones that got worse.
+
+    A case is worse when recall dropped, nDCG dropped, or it went from a
+    hit to a miss. The worse list is sorted largest drop first: the bigger
+    of the recall drop and the nDCG drop, then recall, then nDCG, then id.
+    A drop of 1e-9 or less is ignored.
+
+    Cases that exist on only one side come back as ``added`` and
+    ``removed`` ids. They are not regressions. The first row wins when an
+    id is repeated.
+
+    Older reports have no ``results`` list. Then ``available`` is false
+    and ``message`` says which side is missing, so callers can print that
+    instead of failing.
+    """
+
+    before = _case_results(baseline)
+    after = _case_results(current)
+    empty = {
+        "available": False,
+        "message": None,
+        "worse": [],
+        "added": [],
+        "removed": [],
+    }
+    if before is None:
+        empty["message"] = "baseline report has no per-case results"
+        return empty
+    if after is None:
+        empty["message"] = "current report has no per-case results"
+        return empty
+
+    before_rows = _index_cases(before)
+    after_rows = _index_cases(after)
+    worse = []
+    for case_id in before_rows.keys() & after_rows.keys():
+        row = _worse_case(before_rows[case_id], after_rows[case_id], case_id)
+        if row is not None:
+            worse.append(row)
+    worse.sort(key=_worse_sort_key)
+    return {
+        "available": True,
+        "message": None,
+        "worse": worse,
+        "added": sorted(after_rows.keys() - before_rows.keys()),
+        "removed": sorted(before_rows.keys() - after_rows.keys()),
+    }
+
+
+def format_case_diff(diff: dict, limit: int) -> str:
+    """Plain text section for the cases that got worse."""
+
+    return _render_case_diff(diff, limit, markdown=False)
+
+
+def format_case_diff_markdown(diff: dict, limit: int) -> str:
+    """Markdown section for the cases that got worse."""
+
+    return _render_case_diff(diff, limit, markdown=True)
+
+
+def comparison_payload(
+    baseline_path: Path,
+    current_path: Path,
+    baseline: dict,
+    current: dict,
+    max_drop: float,
+    diff: dict,
+    limit: int,
+) -> dict:
+    """JSON body for ``compare --json``.
+
+    ``cases.worse`` follows ``limit`` (0 stores none). ``worse_count`` and
+    ``recall_dropped`` cover every matched case, so the cap does not hide
+    a recall drop from the gate.
+    """
+
+    failed = regressed_metrics(baseline, current, max_drop)
+    failed_set = set(failed)
+    metrics = {}
+    for name in METRIC_NAMES:
+        before = baseline["metrics"][name]
+        after = current["metrics"][name]
+        metrics[name] = {
+            "baseline": before,
+            "current": after,
+            "delta": round(after - before, 6),
+            "status": "FAIL" if name in failed_set else "pass",
+        }
+    shown = [] if limit <= 0 else diff["worse"][:limit]
+    cases: dict = {
+        "available": diff["available"],
+        "worse_count": len(diff["worse"]),
+        "worse": [_public_case(row) for row in shown],
+        "added": {"count": len(diff["added"]), "ids": list(diff["added"])},
+        "removed": {"count": len(diff["removed"]), "ids": list(diff["removed"])},
+        "recall_dropped": [row["id"] for row in diff["worse"] if row["recall_dropped"]],
+    }
+    if diff["message"]:
+        cases["message"] = diff["message"]
+    return {
+        "baseline": str(baseline_path),
+        "current": str(current_path),
+        "k": {"baseline": _k_value(baseline), "current": _k_value(current)},
+        "max_drop": max_drop,
+        "metrics": metrics,
+        "regressed": failed,
+        "cases": cases,
+    }
+
+
+def _case_results(report: dict) -> list | None:
+    results = report.get("results", None)
+    if isinstance(results, list):
+        return results
+    return None
+
+
+def _index_cases(results: list) -> dict[str, dict]:
+    indexed: dict[str, dict] = {}
+    for row in results:
+        if not isinstance(row, dict):
+            continue
+        case_id = row.get("id")
+        if isinstance(case_id, str):
+            case_id = case_id.strip()
+        if not isinstance(case_id, str) or not case_id or case_id in indexed:
+            continue
+        indexed[case_id] = row
+    return indexed
+
+
+def _worse_case(before: dict, after: dict, case_id: str) -> dict | None:
+    base_recall = _case_metric(before, "recall")
+    cur_recall = _case_metric(after, "recall")
+    base_ndcg = _case_metric(before, "ndcg")
+    cur_ndcg = _case_metric(after, "ndcg")
+    base_hit = _case_metric(before, "hit_rate")
+    cur_hit = _case_metric(after, "hit_rate")
+    recall_dropped = _metric_dropped(base_recall, cur_recall)
+    ndcg_dropped = _metric_dropped(base_ndcg, cur_ndcg)
+    hit_lost = _hit_lost(base_hit, cur_hit)
+    if not (recall_dropped or ndcg_dropped or hit_lost):
+        return None
+    query = after.get("query")
+    if not isinstance(query, str) or not query.strip():
+        query = before.get("query")
+    if not isinstance(query, str):
+        query = ""
+    return {
+        "id": case_id,
+        "query": query.strip(),
+        "recall": {"baseline": base_recall, "current": cur_recall},
+        "ndcg": {"baseline": base_ndcg, "current": cur_ndcg},
+        "hit_rate": {"baseline": base_hit, "current": cur_hit},
+        "hit_lost": hit_lost,
+        "recall_dropped": recall_dropped,
+        "newly_missed": _newly_missed(before, after),
+    }
+
+
+def _worse_sort_key(row: dict) -> tuple:
+    recall_drop = _positive_drop(row["recall"]["baseline"], row["recall"]["current"])
+    ndcg_drop = _positive_drop(row["ndcg"]["baseline"], row["ndcg"]["current"])
+    hit = 0 if row["hit_lost"] else 1
+    return (-max(recall_drop, ndcg_drop), -recall_drop, -ndcg_drop, hit, row["id"])
+
+
+def _metric_dropped(before: float | None, after: float | None) -> bool:
+    if before is None or after is None:
+        return False
+    return before - after > _DELTA_EPSILON
+
+
+def _positive_drop(before: float | None, after: float | None) -> float:
+    if before is None or after is None:
+        return 0.0
+    drop = before - after
+    if drop <= _DELTA_EPSILON:
+        return 0.0
+    return drop
+
+
+def _hit_lost(before: float | None, after: float | None) -> bool:
+    if before is None or after is None:
+        return False
+    return before >= 1.0 - _DELTA_EPSILON and after <= _DELTA_EPSILON
+
+
+def _case_metric(row: dict, name: str) -> float | None:
+    metrics = row.get("metrics")
+    if not isinstance(metrics, dict) or name not in metrics:
+        return None
+    value = metrics[name]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def _newly_missed(before: dict, after: dict) -> list[str]:
+    previous = set(_misses(before))
+    return [doc_id for doc_id in _misses(after) if doc_id not in previous]
+
+
+def _misses(row: dict) -> list[str]:
+    misses = row.get("misses")
+    if isinstance(misses, list):
+        return [doc_id for doc_id in misses if isinstance(doc_id, str) and doc_id]
+    retrieved = row.get("retrieved")
+    relevant = row.get("relevant")
+    if not isinstance(retrieved, list) or not isinstance(relevant, dict):
+        return []
+    present = {doc_id for doc_id in retrieved if isinstance(doc_id, str)}
+    found = []
+    for doc_id, grade in relevant.items():
+        if not isinstance(doc_id, str) or not doc_id:
+            continue
+        if isinstance(grade, bool) or not isinstance(grade, (int, float)):
+            continue
+        if grade > 0 and doc_id not in present:
+            found.append(doc_id)
+    return found
+
+
+def _public_case(row: dict) -> dict:
+    return {
+        "id": row["id"],
+        "query": row["query"],
+        "recall": dict(row["recall"]),
+        "ndcg": dict(row["ndcg"]),
+        "hit_lost": row["hit_lost"],
+        "newly_missed": list(row["newly_missed"]),
+    }
+
+
+def _k_value(report: dict) -> int | None:
+    value = report.get("k")
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return None
+
+
+def _render_case_diff(diff: dict, limit: int, *, markdown: bool) -> str:
+    if markdown:
+        lines = ["### worse cases", ""]
+    else:
+        lines = ["worse cases"]
+    if not diff["available"]:
+        lines.append(diff["message"])
+    else:
+        worse = diff["worse"]
+        if limit <= 0:
+            lines.append("none" if not worse else f"{len(worse)} hidden")
+        elif not worse:
+            lines.append("none")
+        else:
+            shown = worse[:limit]
+            if markdown:
+                lines.append(_markdown_case_table(shown))
+            else:
+                lines.append(_text_case_table(shown))
+            if len(worse) > limit:
+                lines.append(f"showing {limit} of {len(worse)}")
+    membership = _membership_lines(diff)
+    if membership:
+        lines.append("")
+        lines.extend(membership)
+    return "\n".join(lines)
+
+
+def _text_case_table(rows: list[dict]) -> str:
+    table = [
+        [
+            row["id"],
+            _truncate_query(row["query"]),
+            _score_text(row["recall"]["baseline"]),
+            _score_text(row["recall"]["current"]),
+            _score_text(row["ndcg"]["baseline"]),
+            _score_text(row["ndcg"]["current"]),
+            _missed_text(row["newly_missed"]),
+        ]
+        for row in rows
+    ]
+    return render_table(
+        [
+            "case",
+            "query",
+            "recall baseline",
+            "recall current",
+            "ndcg baseline",
+            "ndcg current",
+            "newly missed",
+        ],
+        table,
+    )
+
+
+def _markdown_case_table(rows: list[dict]) -> str:
+    headers = [
+        "case",
+        "query",
+        "recall baseline",
+        "recall current",
+        "ndcg baseline",
+        "ndcg current",
+        "newly missed",
+    ]
+    aligns = ["---", "---", "---:", "---:", "---:", "---:", "---"]
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join(aligns) + " |",
+    ]
+    for row in rows:
+        cells = [
+            _markdown_cell(row["id"]),
+            _markdown_cell(_truncate_query(row["query"])),
+            _score_text(row["recall"]["baseline"]),
+            _score_text(row["recall"]["current"]),
+            _score_text(row["ndcg"]["baseline"]),
+            _score_text(row["ndcg"]["current"]),
+            _markdown_cell(_missed_text(row["newly_missed"])),
+        ]
+        lines.append("| " + " | ".join(cells) + " |")
+    return "\n".join(lines)
+
+
+def _membership_lines(diff: dict) -> list[str]:
+    if not diff["available"]:
+        return []
+    lines = []
+    if diff["added"]:
+        lines.append(_id_line("added", diff["added"]))
+    if diff["removed"]:
+        lines.append(_id_line("removed", diff["removed"]))
+    return lines
+
+
+def _id_line(label: str, ids: list[str]) -> str:
+    return f"{label}: {len(ids)} ({', '.join(ids)})"
+
+
+def _score_text(value: float | None) -> str:
+    if value is None:
+        return "-"
+    return f"{value:.4f}"
+
+
+def _missed_text(doc_ids: list[str]) -> str:
+    if not doc_ids:
+        return "-"
+    return ", ".join(doc_ids)
+
+
+def _truncate_query(query: str, limit: int = _QUERY_LIMIT) -> str:
+    text = " ".join(query.split())
+    if len(text) <= limit:
+        return text
+    if limit <= 3:
+        return text[:limit]
+    return text[: limit - 3] + "..."
+
+
+def _markdown_cell(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("|", "\\|")
 
 
 def write_output(path: Path, text: str) -> None:

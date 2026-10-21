@@ -11,6 +11,10 @@ from retrieval_gate.errors import ConfigError, DatasetError
 from retrieval_gate.metrics import METRIC_NAMES
 from retrieval_gate.report import (
     build_report,
+    case_diff,
+    comparison_payload,
+    format_case_diff,
+    format_case_diff_markdown,
     format_comparison,
     format_markdown,
     format_report,
@@ -161,14 +165,31 @@ def compare(
         "--output",
         help="Write the formatted report to this path.",
     ),
+    json_output: Path | None = typer.Option(
+        None,
+        "--json",
+        help="Write the JSON comparison to this path.",
+    ),
+    show_cases: int = typer.Option(
+        10,
+        "--show-cases",
+        help="How many worse cases to list. The default is 10. 0 hides the list.",
+    ),
+    fail_on_case_regression: bool = typer.Option(
+        False,
+        "--fail-on-case-regression",
+        help="Exit 1 when any matched case has a lower recall. Off by default.",
+    ),
 ) -> None:
     """Compare two JSON reports and fail on a regression."""
 
     try:
         fmt = _checked_format(report_format)
         _checked_max_drop(max_drop)
+        _checked_show_cases(show_cases)
         before = load_report(baseline)
         after = load_report(current)
+        diff = case_diff(before, after)
         if fmt == "markdown":
             text = format_markdown(
                 after,
@@ -179,12 +200,33 @@ def compare(
                 check_thresholds=False,
             )
             failed = regressed_metrics(before, after, max_drop)
+            section = format_case_diff_markdown(diff, show_cases)
         else:
             text, failed = format_comparison(baseline, current, before, after, max_drop)
-        _emit(text, output)
+            section = format_case_diff(diff, show_cases)
+        recall_ids = [row["id"] for row in diff["worse"] if row["recall_dropped"]]
+        if fail_on_case_regression and recall_ids:
+            section = f"{section}\n\ncase recall dropped: {', '.join(recall_ids)}"
+            case_failed = True
+        else:
+            case_failed = False
+        _emit(f"{text}\n\n{section}", output)
+        if json_output is not None:
+            write_report(
+                json_output,
+                comparison_payload(
+                    baseline,
+                    current,
+                    before,
+                    after,
+                    max_drop,
+                    diff,
+                    show_cases,
+                ),
+            )
     except (DatasetError, ConfigError) as exc:
         _fail(str(exc))
-    if failed:
+    if failed or case_failed:
         raise typer.Exit(code=1)
 
 
@@ -353,6 +395,12 @@ def _checked_format(value: str) -> str:
 def _checked_max_drop(value: float) -> float:
     if not math.isfinite(value) or value < 0:
         raise ConfigError("--max-drop must be a number greater than or equal to 0")
+    return value
+
+
+def _checked_show_cases(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ConfigError("--show-cases must be an integer >= 0")
     return value
 
 
