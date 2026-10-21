@@ -155,6 +155,45 @@ retrieval-gate run \
   --fail-under recall=0.8
 ```
 
+## GitHub Actions
+
+`--format markdown` prints a table of metrics, thresholds, baseline deltas, and pass/fail. Use it in a pull request comment or `$GITHUB_STEP_SUMMARY`. `--output` writes that same text to a file. `run` and `compare` both accept the two flags.
+
+```bash
+retrieval-gate run \
+  --dataset examples/cases.jsonl \
+  --retriever examples.retriever:retrieve \
+  --k 5 \
+  --fail-under recall=0.8 \
+  --fail-under mrr=0.6 \
+  --baseline examples/baseline.json \
+  --format markdown \
+  --output report.md
+```
+
+With no baseline, the baseline and delta columns are dashes. A score below its threshold fails. With a baseline, a drop larger than `--max-drop` (default 0.02) also fails. A drop equal to the limit passes. The text report is unchanged, and a comparison table is appended when a baseline is set.
+
+`compare` prints the same markdown table. The status column is the baseline check. Thresholds stored in the current report are shown and do not change the compare exit code.
+
+`action.yml` installs the package, runs the gate, and appends the report to the job summary. Copy `examples/retrieval.yml` to `.github/workflows/retrieval.yml`:
+
+```yaml
+name: retrieval
+on: [pull_request]
+jobs:
+  retrieval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./
+        with:
+          config: examples/gate.yml
+          dataset: examples/cases.jsonl
+          baseline: examples/baseline.json
+```
+
+`examples/gate.yml` holds the retriever, cutoff, and thresholds for the checked-in example. Paths in that file are relative to the file. The `dataset` and `baseline` inputs override it when you set them. In another repository, replace `./` with `sandeep-paluru/retrieval-gate@<ref>`. The step fails on a missed threshold or a baseline drop, after the summary is written.
+
 ## Roadmap
 
 - Adapters for LangChain and LlamaIndex retrievers

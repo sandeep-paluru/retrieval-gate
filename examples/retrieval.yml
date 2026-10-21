@@ -1,0 +1,12 @@
+name: retrieval
+on: [pull_request]
+jobs:
+  retrieval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./
+        with:
+          config: examples/gate.yml
+          dataset: examples/cases.jsonl
+          baseline: examples/baseline.json
