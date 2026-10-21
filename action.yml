@@ -1,0 +1,116 @@
+name: Retrieval gate
+description: >
+  Score a retriever against a labeled dataset, compare an optional baseline,
+  and append a markdown report to the job summary.
+
+inputs:
+  config:
+    description: >
+      Path to a YAML config. Keys are dataset, retriever, k, fail_under,
+      baseline, and max_drop. Paths inside the file are relative to the file.
+    required: false
+    default: ""
+  dataset:
+    description: Path to the labeled dataset (.jsonl, .yaml, or .yml). Overrides config.
+    required: false
+    default: ""
+  baseline:
+    description: >
+      Path to a baseline JSON report. When set, a drop larger than max-drop
+      fails the step. Overrides config.
+    required: false
+    default: ""
+  retriever:
+    description: Import path of the retriever, as module.submodule:function. Overrides config.
+    required: false
+    default: ""
+  k:
+    description: Number of unique results to score per query. Overrides config. Defaults to 5.
+    required: false
+    default: ""
+  fail-under:
+    description: >
+      Space-separated thresholds, for example "recall=0.8 mrr=0.6".
+      Overrides config when set.
+    required: false
+    default: ""
+  max-drop:
+    description: >
+      Fail when any metric drops by more than this versus the baseline.
+      An equal drop passes. Overrides config. Defaults to 0.02.
+    required: false
+    default: ""
+  python-version:
+    description: Python version used to install and run retrieval-gate.
+    required: false
+    default: "3.12"
+  working-directory:
+    description: Directory the retriever is imported from.
+    required: false
+    default: ${{ github.workspace }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install retrieval-gate
+      shell: bash
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install "$GITHUB_ACTION_PATH"
+
+    - name: Run retrieval-gate
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        RG_CONFIG: ${{ inputs.config }}
+        RG_DATASET: ${{ inputs.dataset }}
+        RG_BASELINE: ${{ inputs.baseline }}
+        RG_RETRIEVER: ${{ inputs.retriever }}
+        RG_K: ${{ inputs.k }}
+        RG_FAIL_UNDER: ${{ inputs.fail-under }}
+        RG_MAX_DROP: ${{ inputs.max-drop }}
+      run: |
+        set -euo pipefail
+        report="${RUNNER_TEMP:-/tmp}/retrieval-gate.md"
+        cmd=(retrieval-gate run --format markdown --output "$report")
+        if [[ -n "$RG_CONFIG" ]]; then
+          cmd+=(--config "$RG_CONFIG")
+        fi
+        if [[ -n "$RG_DATASET" ]]; then
+          cmd+=(--dataset "$RG_DATASET")
+        fi
+        if [[ -n "$RG_RETRIEVER" ]]; then
+          cmd+=(--retriever "$RG_RETRIEVER")
+        fi
+        if [[ -n "$RG_K" ]]; then
+          cmd+=(--k "$RG_K")
+        fi
+        if [[ -n "$RG_BASELINE" ]]; then
+          cmd+=(--baseline "$RG_BASELINE")
+        fi
+        if [[ -n "$RG_MAX_DROP" ]]; then
+          cmd+=(--max-drop "$RG_MAX_DROP")
+        fi
+        if [[ -n "$RG_FAIL_UNDER" ]]; then
+          read -r -a limits <<< "$RG_FAIL_UNDER"
+          for item in "${limits[@]}"; do
+            cmd+=(--fail-under "$item")
+          done
+        fi
+        set +e
+        "${cmd[@]}"
+        status=$?
+        set -e
+        if [[ -f "$report" && -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+          cat "$report" >> "$GITHUB_STEP_SUMMARY"
+        fi
+        if [[ ! -f "$report" && "$status" -eq 0 ]]; then
+          echo "retrieval-gate did not write a markdown report" >&2
+          status=1
+        fi
+        exit "$status"

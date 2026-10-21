@@ -1,0 +1,218 @@
+{
+  "k": 5,
+  "dataset": "examples/cases.jsonl",
+  "retriever": "examples.retriever:retrieve",
+  "case_count": 10,
+  "metrics": {
+    "hit_rate": 1.0,
+    "recall": 1.0,
+    "precision": 0.22,
+    "mrr": 1.0,
+    "ndcg": 0.996394
+  },
+  "thresholds": {
+    "recall": 0.8,
+    "mrr": 0.6
+  },
+  "failed": [],
+  "results": [
+    {
+      "id": "q01",
+      "query": "how do I reset my password",
+      "retrieved": [
+        "d01"
+      ],
+      "relevant": {
+        "d01": 1
+      },
+      "misses": [],
+      "metrics": {
+        "hit_rate": 1.0,
+        "recall": 1.0,
+        "precision": 0.2,
+        "mrr": 1.0,
+        "ndcg": 1.0
+      }
+    },
+    {
+      "id": "q02",
+      "query": "enable two factor authentication",
+      "retrieved": [
+        "d02"
+      ],
+      "relevant": {
+        "d02": 1
+      },
+      "misses": [],
+      "metrics": {
+        "hit_rate": 1.0,
+        "recall": 1.0,
+        "precision": 0.2,
+        "mrr": 1.0,
+        "ndcg": 1.0
+      }
+    },
+    {
+      "id": "q03",
+      "query": "where can I download a monthly invoice",
+      "retrieved": [
+        "d03",
+        "d10",
+        "d09",
+        "d01",
+        "d06"
+      ],
+      "relevant": {
+        "d03": 1
+      },
+      "misses": [],
+      "metrics": {
+        "hit_rate": 1.0,
+        "recall": 1.0,
+        "precision": 0.2,
+        "mrr": 1.0,
+        "ndcg": 1.0
+      }
+    },
+    {
+      "id": "q04",
+      "query": "how long do refunds take",
+      "retrieved": [
+        "d04"
+      ],
+      "relevant": {
+        "d04": 1
+      },
+      "misses": [],
+      "metrics": {
+        "hit_rate": 1.0,
+        "recall": 1.0,
+        "precision": 0.2,
+        "mrr": 1.0,
+        "ndcg": 1.0
+      }
+    },
+    {
+      "id": "q05",
+      "query": "create an api key",
+      "retrieved": [
+        "d05",
+        "d02",
+        "d06",
+        "d10"
+      ],
+      "relevant": {
+        "d05": 1
+      },
+      "misses": [],
+      "metrics": {
+        "hit_rate": 1.0,
+        "recall": 1.0,
+        "precision": 0.2,
+        "mrr": 1.0,
+        "ndcg": 1.0
+      }
+    },
+    {
+      "id": "q06",
+      "query": "what does http 429 mean",
+      "retrieved": [
+        "d06"
+      ],
+      "relevant": {
+        "d06": 1
+      },
+      "misses": [],
+      "metrics": {
+        "hit_rate": 1.0,
+        "recall": 1.0,
+        "precision": 0.2,
+        "mrr": 1.0,
+        "ndcg": 1.0
+      }
+    },
+    {
+      "id": "q07",
+      "query": "set up saml single sign on",
+      "retrieved": [
+        "d07",
+        "d02",
+        "d05"
+      ],
+      "relevant": {
+        "d07": 1
+      },
+      "misses": [],
+      "metrics": {
+        "hit_rate": 1.0,
+        "recall": 1.0,
+        "precision": 0.2,
+        "mrr": 1.0,
+        "ndcg": 1.0
+      }
+    },
+    {
+      "id": "q08",
+      "query": "export account data as csv",
+      "retrieved": [
+        "d08",
+        "d03"
+      ],
+      "relevant": {
+        "d08": 1
+      },
+      "misses": [],
+      "metrics": {
+        "hit_rate": 1.0,
+        "recall": 1.0,
+        "precision": 0.2,
+        "mrr": 1.0,
+        "ndcg": 1.0
+      }
+    },
+    {
+      "id": "q09",
+      "query": "invite a teammate and assign a role",
+      "retrieved": [
+        "d09",
+        "d01",
+        "d03",
+        "d06",
+        "d10"
+      ],
+      "relevant": {
+        "d09": 1
+      },
+      "misses": [],
+      "metrics": {
+        "hit_rate": 1.0,
+        "recall": 1.0,
+        "precision": 0.2,
+        "mrr": 1.0,
+        "ndcg": 1.0
+      }
+    },
+    {
+      "id": "q10",
+      "query": "webhook when an invoice is paid",
+      "retrieved": [
+        "d10",
+        "d05",
+        "d03",
+        "d02"
+      ],
+      "relevant": {
+        "d10": 2,
+        "d03": 1
+      },
+      "misses": [],
+      "metrics": {
+        "hit_rate": 1.0,
+        "recall": 1.0,
+        "precision": 0.4,
+        "mrr": 1.0,
+        "ndcg": 0.96394
+      }
+    }
+  ]
+}

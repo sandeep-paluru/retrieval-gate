@@ -56,6 +56,68 @@ def test_compare_command_pass_and_fail(tmp_path):
     assert "-0.0300" in (dropped.stdout or "")
 
 
+def test_compare_markdown_marks_regression(tmp_path):
+    baseline = tmp_path / "baseline.json"
+    current = tmp_path / "current.json"
+    _write(baseline, 1.0)
+    _write(current, 0.97)
+    output = tmp_path / "compare.md"
+    result = runner.invoke(
+        app,
+        [
+            "compare",
+            str(baseline),
+            str(current),
+            "--max-drop",
+            "0.02",
+            "--format",
+            "markdown",
+            "--output",
+            str(output),
+        ],
+    )
+    text = result.stdout or ""
+    assert result.exit_code == 1, _output(result)
+    assert text == (
+        "## retrieval-gate\n"
+        "\n"
+        "k: 5\n"
+        f"baseline: {baseline}\n"
+        f"current: {current}\n"
+        "max drop: 0.0200\n"
+        "\n"
+        "| metric | score | threshold | baseline | delta | status |\n"
+        "| --- | ---: | ---: | ---: | ---: | --- |\n"
+        "| hit_rate | 0.9700 | - | 1.0000 | -0.0300 | FAIL |\n"
+        "| recall | 0.9700 | - | 1.0000 | -0.0300 | FAIL |\n"
+        "| precision | 0.9700 | - | 1.0000 | -0.0300 | FAIL |\n"
+        "| mrr | 0.9700 | - | 1.0000 | -0.0300 | FAIL |\n"
+        "| ndcg | 0.9700 | - | 1.0000 | -0.0300 | FAIL |\n"
+        "\n"
+        "regressed: hit_rate, recall, precision, mrr, ndcg\n"
+    )
+    assert output.read_text(encoding="utf-8") == text
+
+
+def test_compare_markdown_shows_thresholds_without_gating_them(tmp_path):
+    baseline = tmp_path / "baseline.json"
+    current = tmp_path / "current.json"
+    score = 0.5
+    payload = _report(score)
+    payload["thresholds"] = {"recall": 0.8}
+    baseline.write_text(json.dumps(_report(score)), encoding="utf-8")
+    current.write_text(json.dumps(payload), encoding="utf-8")
+    result = runner.invoke(
+        app,
+        ["compare", str(baseline), str(current), "--format", "markdown"],
+    )
+    text = result.stdout or ""
+    assert result.exit_code == 0, _output(result)
+    assert "| recall | 0.5000 | 0.8000 | 0.5000 | +0.0000 | pass |" in text
+    assert "failed:" not in text
+    assert "regressed" not in text
+
+
 def test_compare_rejects_bad_input(tmp_path):
     baseline = tmp_path / "baseline.json"
     current = tmp_path / "current.json"

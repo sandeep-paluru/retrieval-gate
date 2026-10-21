@@ -199,6 +199,16 @@ def regressed(baseline: float, current: float, max_drop: float) -> bool:
     return (baseline - current) - max_drop > 1e-9
 
 
+def regressed_metrics(baseline: dict, current: dict, max_drop: float) -> list[str]:
+    """Return metrics that fell by more than ``max_drop``, in report order."""
+
+    return [
+        name
+        for name in METRIC_NAMES
+        if regressed(baseline["metrics"][name], current["metrics"][name], max_drop)
+    ]
+
+
 def format_comparison(
     baseline_path: Path,
     current_path: Path,
@@ -208,15 +218,14 @@ def format_comparison(
 ) -> tuple[str, list[str]]:
     """Return the comparison table and the metrics that regressed."""
 
+    failed = regressed_metrics(baseline, current, max_drop)
+    failed_set = set(failed)
     rows = []
-    failed = []
     for name in METRIC_NAMES:
         before = baseline["metrics"][name]
         after = current["metrics"][name]
         delta = after - before
-        status = "FAIL" if regressed(before, after, max_drop) else "pass"
-        if status == "FAIL":
-            failed.append(name)
+        status = "FAIL" if name in failed_set else "pass"
         rows.append([name, f"{before:.4f}", f"{after:.4f}", f"{delta:+.4f}", status])
     lines = [
         f"baseline: {baseline_path}",
@@ -236,3 +245,119 @@ def _k_text(report: dict) -> str:
     if isinstance(value, int) and not isinstance(value, bool):
         return str(value)
     return "-"
+
+
+def format_markdown(
+    report: dict,
+    *,
+    baseline: dict | None = None,
+    max_drop: float = 0.02,
+    baseline_path: str | None = None,
+    current_path: str | None = None,
+    check_thresholds: bool = True,
+) -> str:
+    """Return a compact Markdown table for a pull request or job summary.
+
+    Columns are the metric, score, threshold, baseline, delta, and status.
+    When ``baseline`` is omitted, the baseline and delta cells are dashes
+    and no metric is marked as a regression. A threshold fails when the
+    score is strictly below the limit. A regression fails when the score
+    drops by more than ``max_drop``. ``check_thresholds`` can be turned
+    off by ``compare``, which still prints stored limits but gates only
+    on the baseline drop.
+    """
+
+    thresholds = report.get("thresholds") or {}
+    dropped = regressed_metrics(baseline, report, max_drop) if baseline is not None else []
+    dropped_set = set(dropped)
+    failed: list[str] = []
+    rows: list[list[str]] = []
+    for name in METRIC_NAMES:
+        score = report["metrics"][name]
+        limit = thresholds.get(name)
+        if baseline is None:
+            base_text = "-"
+            delta_text = "-"
+            drop_failed = False
+        else:
+            before = baseline["metrics"][name]
+            base_text = f"{before:.4f}"
+            delta_text = f"{score - before:+.4f}"
+            drop_failed = name in dropped_set
+        threshold_failed = bool(check_thresholds and limit is not None and score < limit)
+        if threshold_failed:
+            failed.append(name)
+        if threshold_failed or drop_failed:
+            status = "FAIL"
+        elif (check_thresholds and limit is not None) or baseline is not None:
+            status = "pass"
+        else:
+            status = "-"
+        limit_text = "-" if limit is None else f"{limit:.4f}"
+        rows.append([name, f"{score:.4f}", limit_text, base_text, delta_text, status])
+
+    lines = ["## retrieval-gate"]
+    context = _markdown_context(report, baseline, max_drop, baseline_path, current_path)
+    if context:
+        lines.append("")
+        lines.extend(context)
+    lines.extend(["", _markdown_table(rows)])
+    notes = []
+    if failed:
+        notes.append("failed: " + ", ".join(failed))
+    if dropped:
+        notes.append("regressed: " + ", ".join(dropped))
+    if notes:
+        lines.append("")
+        lines.extend(notes)
+    return "\n".join(lines)
+
+
+def _markdown_context(
+    report: dict,
+    baseline: dict | None,
+    max_drop: float,
+    baseline_path: str | None,
+    current_path: str | None,
+) -> list[str]:
+    lines = []
+    dataset = report.get("dataset")
+    if isinstance(dataset, str) and dataset:
+        lines.append(f"dataset: {dataset}")
+    retriever = report.get("retriever")
+    if isinstance(retriever, str) and retriever:
+        lines.append(f"retriever: {retriever}")
+    k = report.get("k")
+    if isinstance(k, int) and not isinstance(k, bool):
+        lines.append(f"k: {k}")
+    count = report.get("case_count")
+    if isinstance(count, int) and not isinstance(count, bool):
+        lines.append(f"cases: {count}")
+    if baseline_path:
+        lines.append(f"baseline: {baseline_path}")
+    if current_path:
+        lines.append(f"current: {current_path}")
+    if baseline is not None:
+        lines.append(f"max drop: {max_drop:.4f}")
+    return lines
+
+
+def _markdown_table(rows: list[list[str]]) -> str:
+    headers = ["metric", "score", "threshold", "baseline", "delta", "status"]
+    aligns = ["---", "---:", "---:", "---:", "---:", "---"]
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join(aligns) + " |",
+    ]
+    lines.extend("| " + " | ".join(row) + " |" for row in rows)
+    return "\n".join(lines)
+
+
+def write_output(path: Path, text: str) -> None:
+    """Write a formatted report, adding a trailing newline when needed."""
+
+    payload = text if text.endswith("\n") else text + "\n"
+    try:
+        path.write_text(payload, encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"could not write {path}: {exc}") from exc

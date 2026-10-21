@@ -1,0 +1,8 @@
+dataset: cases.jsonl
+retriever: examples.retriever:retrieve
+k: 5
+fail_under:
+  recall: 0.8
+  mrr: 0.6
+baseline: baseline.json
+max_drop: 0.02
