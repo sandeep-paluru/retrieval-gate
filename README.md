@@ -115,8 +115,11 @@ The report then lists up to 10 cases that missed at least one relevant id, lowes
 
 Save a JSON report from a known-good retriever and check later runs against it. `compare` prints the per-metric delta (current minus baseline) and exits 1 when any metric drops by more than `--max-drop` (default 0.02). A drop equal to the limit passes.
 
+It also lists cases that got worse, matched by id. A case is listed when recall dropped, nDCG dropped, or a hit became a miss. The worst 10 are shown. `--show-cases N` changes that cap, and `--show-cases 0` hides the list. Each row has the case id, the query shortened to 60 characters, baseline and current recall and nDCG, and doc ids that are missed now but were not missed in the baseline. Cases found in only one report are printed as a count and their ids. That does not fail the command. `--fail-on-case-regression` exits 1 when any single case recall drops. It is off by default, so the exit code stays the aggregate check. The same section is in the text report, in `--format markdown`, and in the file from `--json`. A baseline written before per-case results existed prints a note instead of the list.
+
 ```bash
 retrieval-gate compare baseline.json report.json --max-drop 0.02
+retrieval-gate compare baseline.json report.json --show-cases 10 --json compare.json
 ```
 
 A GitHub Actions job that regenerates the report and compares it:
@@ -173,7 +176,7 @@ retrieval-gate run \
 
 With no baseline, the baseline and delta columns are dashes. A score below its threshold fails. With a baseline, a drop larger than `--max-drop` (default 0.02) also fails. A drop equal to the limit passes. The text report is unchanged, and a comparison table is appended when a baseline is set.
 
-`compare` prints the same markdown table. The status column is the baseline check. Thresholds stored in the current report are shown and do not change the compare exit code.
+`compare` prints the same markdown table, then the worse-case section. The status column is the baseline check. Thresholds stored in the current report are shown and do not change the compare exit code.
 
 `action.yml` installs the package, runs the gate, and appends the report to the job summary. Copy `examples/retrieval.yml` to `.github/workflows/retrieval.yml`:
 
