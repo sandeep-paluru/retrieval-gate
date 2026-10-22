@@ -3,7 +3,7 @@ import json
 from typer.testing import CliRunner
 
 from retrieval_gate.cli import app
-from retrieval_gate.report import case_diff, load_report, regressed
+from retrieval_gate.report import case_diff, load_report, regressed, tag_diff
 
 runner = CliRunner()
 
@@ -439,6 +439,178 @@ def test_compare_json_includes_capped_cases(tmp_path):
     assert payload["cases"]["added"] == {"count": 1, "ids": ["q_new"]}
     assert payload["cases"]["removed"] == {"count": 1, "ids": ["q_old"]}
     assert payload["metrics"]["recall"]["status"] == "pass"
+
+
+def _metrics(score: float, **overrides: float) -> dict[str, float]:
+    values = {name: score for name in ("hit_rate", "recall", "precision", "mrr", "ndcg")}
+    values.update(overrides)
+    return values
+
+
+def _tag(tag: str, score: float, cases: int = 2, **overrides: float) -> dict:
+    return {"tag": tag, "case_count": cases, "metrics": _metrics(score, **overrides)}
+
+
+def _write_tagged(path, score: float, tags: list[dict]) -> None:
+    payload = _report(score)
+    payload["tags"] = tags
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_compare_shows_tag_deltas_without_failing(tmp_path):
+    baseline = tmp_path / "baseline.json"
+    current = tmp_path / "current.json"
+    _write_tagged(
+        baseline,
+        1.0,
+        [_tag("billing", 1.0), _tag("api", 1.0, cases=1), _tag("old", 1.0, cases=1)],
+    )
+    _write_tagged(
+        current,
+        1.0,
+        [
+            _tag("billing", 1.0, recall=0.9),
+            _tag("api", 1.0, cases=2),
+            _tag("new", 1.0, cases=1),
+        ],
+    )
+    quiet = runner.invoke(app, ["compare", str(baseline), str(current), "--max-drop", "0.02"])
+    text = quiet.stdout or ""
+    assert quiet.exit_code == 0, _output(quiet)
+    assert "billing" in text
+    assert "2 -> 2" in text
+    assert "-0.1000" in text
+    assert "added tags: 1 (new)" in text
+    assert "removed tags: 1 (old)" in text
+    assert "regressed tags:" not in text
+    assert "FAIL" not in text
+
+    failed = runner.invoke(
+        app,
+        ["compare", str(baseline), str(current), "--max-drop", "0.02", "--fail-on-tag-regression"],
+    )
+    failed_text = failed.stdout or ""
+    assert failed.exit_code == 1, _output(failed)
+    assert "regressed tags: billing recall" in failed_text
+    assert "FAIL" in failed_text
+
+    _write_tagged(current, 1.0, [_tag("billing", 1.0, recall=0.98)])
+    equal = runner.invoke(
+        app,
+        ["compare", str(baseline), str(current), "--max-drop", "0.02", "--fail-on-tag-regression"],
+    )
+    assert equal.exit_code == 0, _output(equal)
+    assert "-0.0200" in (equal.stdout or "")
+    assert "regressed tags:" not in (equal.stdout or "")
+    assert "FAIL" not in (equal.stdout or "")
+
+
+def test_compare_tag_markdown_and_json(tmp_path):
+    baseline = tmp_path / "baseline.json"
+    current = tmp_path / "current.json"
+    _write_tagged(baseline, 1.0, [_tag("billing", 1.0), _tag("kept", 1.0, cases=1)])
+    _write_tagged(current, 1.0, [_tag("billing", 1.0, recall=0.9), _tag("kept", 1.0, cases=1)])
+    output = tmp_path / "compare.json"
+    result = runner.invoke(
+        app,
+        [
+            "compare",
+            str(baseline),
+            str(current),
+            "--format",
+            "markdown",
+            "--json",
+            str(output),
+            "--fail-on-tag-regression",
+        ],
+    )
+    text = result.stdout or ""
+    assert result.exit_code == 1, _output(result)
+    assert (
+        "| tag | cases | metric | baseline | current | delta | status |\n"
+        "| --- | --- | --- | ---: | ---: | ---: | --- |\n"
+        "| billing | 2 -> 2 | hit_rate | 1.0000 | 1.0000 | +0.0000 | pass |"
+    ) in text
+    assert "| billing | 2 -> 2 | recall | 1.0000 | 0.9000 | -0.1000 | FAIL |" in text
+    assert "regressed tags: billing recall" in text
+    assert text.index("### tags") < text.index("### worse cases")
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["regressed"] == []
+    assert payload["tags"]["available"] is True
+    assert payload["tags"]["checked"] is True
+    assert payload["tags"]["regressed"] == [{"tag": "billing", "metric": "recall"}]
+    billing = payload["tags"]["rows"][0]
+    assert billing["tag"] == "billing"
+    assert billing["metrics"]["recall"]["delta"] == -0.1
+    assert billing["metrics"]["recall"]["status"] == "FAIL"
+    assert billing["metrics"]["hit_rate"]["status"] == "pass"
+
+    plain = runner.invoke(
+        app,
+        ["compare", str(baseline), str(current), "--json", str(output)],
+    )
+    assert plain.exit_code == 0, _output(plain)
+    unchecked = json.loads(output.read_text(encoding="utf-8"))
+    assert unchecked["tags"]["checked"] is False
+    assert unchecked["tags"]["regressed"] == [{"tag": "billing", "metric": "recall"}]
+    assert unchecked["tags"]["rows"][0]["metrics"]["recall"]["status"] == "-"
+
+
+def test_compare_old_baseline_without_tags(tmp_path):
+    baseline = tmp_path / "baseline.json"
+    current = tmp_path / "current.json"
+    _write(baseline, 1.0)
+    _write_tagged(current, 1.0, [_tag("billing", 0.5)])
+
+    noted = runner.invoke(
+        app,
+        [
+            "compare",
+            str(baseline),
+            str(current),
+            "--fail-on-tag-regression",
+            "--format",
+            "markdown",
+        ],
+    )
+    assert noted.exit_code == 0, _output(noted)
+    assert "baseline report has no per-tag results" in (noted.stdout or "")
+    assert "regressed tags:" not in (noted.stdout or "")
+
+    empty = _report(1.0)
+    empty["tags"] = []
+    baseline.write_text(json.dumps(empty), encoding="utf-8")
+    still_empty = runner.invoke(app, ["compare", str(baseline), str(current)])
+    assert still_empty.exit_code == 0, _output(still_empty)
+    assert "baseline report has no per-tag results" in (still_empty.stdout or "")
+
+    _write_tagged(baseline, 1.0, [_tag("billing", 1.0)])
+    _write(current, 1.0)
+    missing_current = runner.invoke(
+        app,
+        ["compare", str(baseline), str(current), "--fail-on-tag-regression"],
+    )
+    assert missing_current.exit_code == 0, _output(missing_current)
+    assert "current report has no per-tag results" in (missing_current.stdout or "")
+
+    _write(current, 0.9)
+    dropped = runner.invoke(
+        app,
+        ["compare", str(baseline), str(current), "--max-drop", "0.02", "--fail-on-tag-regression"],
+    )
+    assert dropped.exit_code == 1, _output(dropped)
+    assert "regressed: hit_rate, recall, precision, mrr, ndcg" in (dropped.stdout or "")
+    assert "current report has no per-tag results" in (dropped.stdout or "")
+    assert "regressed tags:" not in (dropped.stdout or "")
+
+
+def test_tag_diff_treats_a_broken_list_as_missing():
+    baseline = {"tags": [{"tag": "billing"}]}
+    current = {"tags": [_tag("billing", 1.0)]}
+    diff = tag_diff(baseline, current, 0.02)
+    assert diff["available"] is False
+    assert diff["message"] == "baseline report has no per-tag results"
+    assert diff["regressed"] == []
 
 
 def test_compare_old_baseline_without_cases(tmp_path):

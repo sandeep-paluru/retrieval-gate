@@ -20,6 +20,7 @@ from retrieval_gate.report import (
     format_report,
     load_report,
     regressed_metrics,
+    tag_diff,
     write_output,
     write_report,
 )
@@ -32,7 +33,15 @@ app = typer.Typer(
     help="Score a retriever against labeled queries and fail when metrics drop.",
 )
 
-_CONFIG_KEYS = {"dataset", "retriever", "k", "fail_under", "baseline", "max_drop"}
+_CONFIG_KEYS = {
+    "dataset",
+    "retriever",
+    "k",
+    "fail_under",
+    "fail_under_tag",
+    "baseline",
+    "max_drop",
+}
 
 
 def main() -> None:
@@ -63,6 +72,11 @@ def run(
         "--fail-under",
         help="Gate a metric, as name=value. Repeat for more than one metric.",
     ),
+    fail_under_tag: list[str] | None = typer.Option(
+        None,
+        "--fail-under-tag",
+        help="Gate one tag, as tag:metric=value. Repeat for more than one.",
+    ),
     json_output: Path | None = typer.Option(
         None,
         "--json",
@@ -81,7 +95,10 @@ def run(
     config: Path | None = typer.Option(
         None,
         "--config",
-        help="YAML file with dataset, retriever, k, fail_under, baseline, and max_drop.",
+        help=(
+            "YAML file with dataset, retriever, k, fail_under, fail_under_tag, "
+            "baseline, and max_drop."
+        ),
     ),
     baseline: Path | None = typer.Option(
         None,
@@ -103,6 +120,9 @@ def run(
         chosen_retriever = retriever if retriever is not None else cfg["retriever"]
         chosen_k = _choose_k(k, cfg["k"])
         thresholds = parse_fail_under(fail_under) if fail_under else cfg["thresholds"]
+        tag_thresholds = (
+            parse_fail_under_tag(fail_under_tag) if fail_under_tag else cfg["tag_thresholds"]
+        )
         chosen_baseline = baseline if baseline is not None else cfg["baseline"]
         chosen_drop = _choose_max_drop(max_drop, cfg["max_drop"], chosen_baseline)
         if chosen_dataset is None:
@@ -120,6 +140,7 @@ def run(
             dataset=str(chosen_dataset),
             retriever_name=chosen_retriever,
             thresholds=thresholds,
+            tag_thresholds=tag_thresholds,
         )
         baseline_report = (
             load_report(chosen_baseline) if chosen_baseline is not None else None
@@ -142,7 +163,7 @@ def run(
         if baseline_report is not None
         else []
     )
-    if report["failed"] or dropped:
+    if report["failed"] or report.get("failed_tags") or dropped:
         raise typer.Exit(code=1)
 
 
@@ -180,6 +201,11 @@ def compare(
         "--fail-on-case-regression",
         help="Exit 1 when any matched case has a lower recall. Off by default.",
     ),
+    fail_on_tag_regression: bool = typer.Option(
+        False,
+        "--fail-on-tag-regression",
+        help="Exit 1 when any tag metric drops by more than --max-drop. Off by default.",
+    ),
 ) -> None:
     """Compare two JSON reports and fail on a regression."""
 
@@ -190,6 +216,7 @@ def compare(
         before = load_report(baseline)
         after = load_report(current)
         diff = case_diff(before, after)
+        tags = tag_diff(before, after, max_drop)
         if fmt == "markdown":
             text = format_markdown(
                 after,
@@ -198,11 +225,19 @@ def compare(
                 baseline_path=str(baseline),
                 current_path=str(current),
                 check_thresholds=False,
+                check_tags=fail_on_tag_regression,
             )
             failed = regressed_metrics(before, after, max_drop)
             section = format_case_diff_markdown(diff, show_cases)
         else:
-            text, failed = format_comparison(baseline, current, before, after, max_drop)
+            text, failed = format_comparison(
+                baseline,
+                current,
+                before,
+                after,
+                max_drop,
+                check_tags=fail_on_tag_regression,
+            )
             section = format_case_diff(diff, show_cases)
         recall_ids = [row["id"] for row in diff["worse"] if row["recall_dropped"]]
         if fail_on_case_regression and recall_ids:
@@ -210,6 +245,7 @@ def compare(
             case_failed = True
         else:
             case_failed = False
+        tag_failed = bool(fail_on_tag_regression and tags["regressed"])
         _emit(f"{text}\n\n{section}", output)
         if json_output is not None:
             write_report(
@@ -222,11 +258,12 @@ def compare(
                     max_drop,
                     diff,
                     show_cases,
+                    check_tags=fail_on_tag_regression,
                 ),
             )
     except (DatasetError, ConfigError) as exc:
         _fail(str(exc))
-    if failed or case_failed:
+    if failed or case_failed or tag_failed:
         raise typer.Exit(code=1)
 
 
@@ -249,14 +286,48 @@ def parse_fail_under(items: list[str]) -> dict[str, float]:
             raise ConfigError(f"unknown metric {name!r} in --fail-under (expected {names})")
         if name in thresholds:
             raise ConfigError(f"--fail-under metric {name!r} was given twice")
-        try:
-            value = float(raw)
-        except ValueError as exc:
-            raise ConfigError(f"--fail-under {item!r} value is not a number") from exc
-        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
-            raise ConfigError(f"--fail-under {name} must be between 0 and 1")
-        thresholds[name] = value
+        thresholds[name] = _threshold_value("--fail-under", item, name, raw)
     return thresholds
+
+
+def parse_fail_under_tag(items: list[str]) -> dict[str, dict[str, float]]:
+    """Parse repeated ``tag:metric=value`` thresholds.
+
+    Metric names match ``--fail-under``. The value is the minimum allowed
+    mean for cases that carry that tag, from 0 to 1 inclusive.
+    """
+
+    allowed = set(METRIC_NAMES)
+    thresholds: dict[str, dict[str, float]] = {}
+    for item in items:
+        left, sep, raw = item.partition("=")
+        if not sep or ":" not in left:
+            raise ConfigError(f"--fail-under-tag {item!r} must look like tag:metric=value")
+        tag, name = left.rsplit(":", 1)
+        tag = tag.strip()
+        name = name.strip()
+        if not tag:
+            raise ConfigError(f"--fail-under-tag {item!r} is missing a tag")
+        if name not in allowed:
+            names = ", ".join(METRIC_NAMES)
+            raise ConfigError(
+                f"unknown metric {name!r} in --fail-under-tag (expected {names})"
+            )
+        limits = thresholds.setdefault(tag, {})
+        if name in limits:
+            raise ConfigError(f"--fail-under-tag {tag} {name} was given twice")
+        limits[name] = _threshold_value("--fail-under-tag", item, name, raw)
+    return thresholds
+
+
+def _threshold_value(flag: str, item: str, name: str, raw: str) -> float:
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ConfigError(f"{flag} {item!r} value is not a number") from exc
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        raise ConfigError(f"{flag} {name} must be between 0 and 1")
+    return value
 
 
 def load_config(path: Path) -> dict:
@@ -264,6 +335,8 @@ def load_config(path: Path) -> dict:
 
     Paths are resolved relative to the config file. ``fail_under`` may be
     a mapping of metric name to limit, or a list of ``name=value`` strings.
+    ``fail_under_tag`` may be a mapping of tag to metric limits, or a list
+    of ``tag:metric=value`` strings.
     """
 
     if not path.is_file():
@@ -289,6 +362,7 @@ def load_config(path: Path) -> dict:
         "baseline": _config_path(path, raw.get("baseline"), "baseline"),
         "max_drop": _config_max_drop(path, raw.get("max_drop")),
         "thresholds": _config_thresholds(path, raw.get("fail_under")),
+        "tag_thresholds": _config_tag_thresholds(path, raw.get("fail_under_tag")),
     }
 
 
@@ -300,6 +374,7 @@ def _empty_config() -> dict:
         "baseline": None,
         "max_drop": None,
         "thresholds": {},
+        "tag_thresholds": {},
     }
 
 
@@ -383,6 +458,35 @@ def _config_thresholds(path: Path, value: object) -> dict[str, float]:
             items.append(item)
         return parse_fail_under(items)
     raise ConfigError(f"{path}: fail_under must be a mapping or a list")
+
+
+def _config_tag_thresholds(path: Path, value: object) -> dict[str, dict[str, float]]:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        items = []
+        for tag, limits in value.items():
+            if not isinstance(tag, str) or not tag.strip():
+                raise ConfigError(f"{path}: fail_under_tag keys must be tag names")
+            if not isinstance(limits, dict):
+                raise ConfigError(
+                    f"{path}: fail_under_tag.{tag} must be a mapping of metric to limit"
+                )
+            for name, limit in limits.items():
+                if isinstance(limit, bool) or not isinstance(limit, (int, float)):
+                    raise ConfigError(f"{path}: fail_under_tag.{tag}.{name} must be a number")
+                items.append(f"{tag.strip()}:{name}={limit}")
+        return parse_fail_under_tag(items)
+    if isinstance(value, list):
+        items = []
+        for item in value:
+            if not isinstance(item, str):
+                raise ConfigError(
+                    f"{path}: fail_under_tag entries must be tag:metric=value strings"
+                )
+            items.append(item)
+        return parse_fail_under_tag(items)
+    raise ConfigError(f"{path}: fail_under_tag must be a mapping or a list")
 
 
 def _checked_format(value: str) -> str:

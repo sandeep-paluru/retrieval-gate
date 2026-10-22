@@ -8,6 +8,9 @@ class Case(BaseModel):
 
     ``relevant`` is a mapping of document id to a positive integer grade.
     A list of ids in the file is stored as grade 1 for each id.
+
+    ``tags`` is an optional list of labels such as ``billing``. A missing
+    field means the case has no tags. A case can carry more than one.
     """
 
     model_config = ConfigDict(extra="forbid", strict=True)
@@ -15,6 +18,7 @@ class Case(BaseModel):
     id: str = Field(min_length=1)
     query: str = Field(min_length=1)
     relevant: dict[str, int]
+    tags: list[str] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod
@@ -46,6 +50,25 @@ class Case(BaseModel):
         if isinstance(value, str):
             return value.strip()
         return value
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def normalize_tags(cls, value: object) -> object:
+        if not isinstance(value, list):
+            raise ValueError("tags must be a list of non-empty strings")
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            if not isinstance(item, str):
+                raise ValueError("tags must be a list of non-empty strings")
+            tag = item.strip()
+            if not tag:
+                raise ValueError("tags must be non-empty strings")
+            if tag in seen:
+                raise ValueError(f"duplicate tag {tag!r}")
+            seen.add(tag)
+            cleaned.append(tag)
+        return cleaned
 
     @field_validator("relevant")
     @classmethod

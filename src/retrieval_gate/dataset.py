@@ -15,7 +15,8 @@ def load_dataset(path: Path) -> list[Case]:
 
     JSONL is one JSON object per line. Blank lines are ignored. YAML is
     a list of the same objects. An empty relevant set is rejected because
-    recall and nDCG are undefined for it.
+    recall and nDCG are undefined for it. ``tags``, when present, is a
+    list of non-empty strings. A missing field means the case has no tags.
     """
 
     if not path.is_file():

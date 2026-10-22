@@ -50,6 +50,12 @@ precision  0.2200  -          -
 mrr        1.0000  0.6000     pass
 ndcg       0.9964  -          -
 
+tags
+tag      cases  hit_rate  recall  precision  mrr     ndcg
+-------  -----  --------  ------  ---------  ------  ------
+api      2      1.0000    1.0000  0.3000     1.0000  0.9820
+billing  3      1.0000    1.0000  0.2667     1.0000  0.9880
+
 worst misses
 none
 ```
@@ -76,9 +82,11 @@ JSONL is one case per line. YAML is a list of the same objects. Each case has an
 
 An empty relevant set is rejected at load time. Recall and nDCG are undefined when nothing is relevant. Validation errors name the file line (JSONL) or the list index (YAML), and the case id when the line has one.
 
+`tags` is optional. It is a list of non-empty strings, such as `billing` or `long-tail`. Leave it out when a case has no tags. A case can carry more than one.
+
 ```json
 {"id": "q01", "query": "reset password", "relevant": ["d01"]}
-{"id": "q10", "query": "webhook when an invoice is paid", "relevant": {"d10": 2, "d03": 1}}
+{"id": "q10", "query": "webhook when an invoice is paid", "relevant": {"d10": 2, "d03": 1}, "tags": ["billing", "api"]}
 ```
 
 ```yaml
@@ -91,6 +99,9 @@ An empty relevant set is rejected at load time. Recall and nDCG are undefined wh
   relevant:
     d10: 2
     d03: 1
+  tags:
+    - billing
+    - api
 ```
 
 The checked-in files are `examples/cases.jsonl` and `examples/cases.yaml`.
@@ -99,9 +110,11 @@ The checked-in files are `examples/cases.jsonl` and `examples/cases.yaml`.
 
 Scores use the cutoff `--k`. The ranking is the first k unique document ids, in the order returned. A repeated id does not take another rank slot. If that leaves fewer than k ids, the missing positions count as not relevant.
 
-Hit rate, recall, precision, and MRR treat a document as relevant when its grade is greater than 0. nDCG uses the numeric grade. Binary labels are grade 1. The number in the report is the unweighted mean across cases.
+Hit rate, recall, precision, and MRR treat a document as relevant when its grade is greater than 0. nDCG uses the numeric grade. Binary labels are grade 1. The number in the report is the unweighted mean across cases. If any case has tags, a second table lists each tag, how many cases carry it, and the same five scores. A tag score is the unweighted mean of the cases with that tag. A case with two tags counts in both. Cases with no tags stay out of that table. Tags are listed alphabetically.
 
 Threshold names are `hit_rate`, `recall`, `precision`, `mrr`, and `ndcg`. A score below the limit fails. A score equal to the limit passes. A dash in the threshold column means that metric is not gated.
+
+`--fail-under-tag billing:recall=0.8` gates one tag the same way. Repeat the flag for more than one gate. The tag has to be on at least one case, or the run exits 2. In a config file the key is `fail_under_tag`, a mapping of tag to metric limits.
 
 - **Hit rate.** 1 when any relevant id is in the top k, otherwise 0.
 - **Recall.** Relevant ids in the top k, divided by the number of relevant ids.
@@ -109,7 +122,7 @@ Threshold names are `hit_rate`, `recall`, `precision`, `mrr`, and `ndcg`. A scor
 - **MRR.** Reciprocal rank of the first relevant id in the top k. Rank 1 scores 1. No hit scores 0.
 - **nDCG.** Normalized discounted cumulative gain. Gain at 1-based rank i is `(2 ** grade - 1) / log2(i + 1)`. The ideal ranking sorts the case grades descending and keeps at most k of them. nDCG is 0 when no relevant document was retrieved.
 
-The report then lists up to 10 cases that missed at least one relevant id, lowest recall first. The JSON report has every case, including the retrieved ids and the misses.
+The report then lists up to 10 cases that missed at least one relevant id, lowest recall first. The JSON report has every case, including the retrieved ids and the misses. When cases have tags, it also has a `tags` list with each tag's case count and scores.
 
 ## Compare and CI
 
@@ -117,9 +130,12 @@ Save a JSON report from a known-good retriever and check later runs against it. 
 
 It also lists cases that got worse, matched by id. A case is listed when recall dropped, nDCG dropped, or a hit became a miss. The worst 10 are shown. `--show-cases N` changes that cap, and `--show-cases 0` hides the list. Each row has the case id, the query shortened to 60 characters, baseline and current recall and nDCG, and doc ids that are missed now but were not missed in the baseline. Cases found in only one report are printed as a count and their ids. That does not fail the command. `--fail-on-case-regression` exits 1 when any single case recall drops. It is off by default, so the exit code stays the aggregate check. The same section is in the text report, in `--format markdown`, and in the file from `--json`. A baseline written before per-case results existed prints a note instead of the list.
 
+When both reports have per-tag scores, compare also prints each tag's delta. A baseline written before tags existed prints a note and does not fail. `--fail-on-tag-regression` applies `--max-drop` to every tag metric and exits 1 on a drop. It is off by default, so a drop in one tag does not change the exit code. Tags found in only one report are listed and do not fail the command.
+
 ```bash
 retrieval-gate compare baseline.json report.json --max-drop 0.02
 retrieval-gate compare baseline.json report.json --show-cases 10 --json compare.json
+retrieval-gate compare baseline.json report.json --fail-on-tag-regression
 ```
 
 A GitHub Actions job that regenerates the report and compares it:
@@ -160,7 +176,7 @@ retrieval-gate run \
 
 ## GitHub Actions
 
-`--format markdown` prints a table of metrics, thresholds, baseline deltas, and pass/fail. Use it in a pull request comment or `$GITHUB_STEP_SUMMARY`. `--output` writes that same text to a file. `run` and `compare` both accept the two flags.
+`--format markdown` prints a table of metrics, thresholds, baseline deltas, and pass/fail. When cases have tags, it adds the per-tag table. Use it in a pull request comment or `$GITHUB_STEP_SUMMARY`. `--output` writes that same text to a file. `run` and `compare` both accept the two flags.
 
 ```bash
 retrieval-gate run \
@@ -201,4 +217,3 @@ jobs:
 
 - Adapters for LangChain and LlamaIndex retrievers
 - An HTTP retriever for FastAPI services
-- Per-tag breakdowns when cases carry a tag
