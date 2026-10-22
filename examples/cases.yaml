@@ -10,14 +10,20 @@
   query: where can I download a monthly invoice
   relevant:
     - d03
+  tags:
+    - billing
 - id: q04
   query: how long do refunds take
   relevant:
     - d04
+  tags:
+    - billing
 - id: q05
   query: create an api key
   relevant:
     - d05
+  tags:
+    - api
 - id: q06
   query: what does http 429 mean
   relevant:
@@ -39,3 +45,6 @@
   relevant:
     d10: 2
     d03: 1
+  tags:
+    - billing
+    - api

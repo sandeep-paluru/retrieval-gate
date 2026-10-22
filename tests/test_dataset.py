@@ -125,3 +125,79 @@ def test_non_object_case(tmp_path):
     path.write_text("[1, 2]\n", encoding="utf-8")
     with pytest.raises(DatasetError, match="case must be an object"):
         load_dataset(path)
+
+
+def test_tags_default_to_empty_and_round_trip(tmp_path):
+    jsonl = tmp_path / "cases.jsonl"
+    jsonl.write_text(
+        '{"id": "q1", "query": "cats", "relevant": ["d1"]}\n'
+        '{"id": "q2", "query": " dogs ", "relevant": ["d2"], "tags": [" billing ", "long-tail"]}\n',
+        encoding="utf-8",
+    )
+    yaml_path = tmp_path / "cases.yaml"
+    yaml_path.write_text(
+        "- id: q1\n"
+        "  query: cats\n"
+        "  relevant: [d1]\n"
+        "- id: q2\n"
+        "  query: dogs\n"
+        "  relevant: [d2]\n"
+        "  tags: [' billing ', long-tail]\n",
+        encoding="utf-8",
+    )
+    from_json = [case.model_dump() for case in load_dataset(jsonl)]
+    from_yaml = [case.model_dump() for case in load_dataset(yaml_path)]
+    assert from_json == from_yaml
+    assert from_json[0]["tags"] == []
+    assert from_json[1]["tags"] == ["billing", "long-tail"]
+
+
+def test_blank_tag_names_the_line_and_case(tmp_path):
+    path = tmp_path / "cases.jsonl"
+    path.write_text(
+        '{"id": "q1", "query": "ok", "relevant": ["d1"]}\n'
+        '{"id": "q2", "query": "bad", "relevant": ["d1"], "tags": ["billing", " "]}\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(DatasetError, match=r"cases\.jsonl:2: case 'q2':") as caught:
+        load_dataset(path)
+    assert "non-empty" in str(caught.value)
+
+
+def test_yaml_tag_error_names_the_item(tmp_path):
+    path = tmp_path / "cases.yaml"
+    path.write_text(
+        "- id: q1\n"
+        "  query: ok\n"
+        "  relevant: [d1]\n"
+        "- id: q2\n"
+        "  query: bad\n"
+        "  relevant: [d1]\n"
+        "  tags: [1]\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(DatasetError, match=r"item 2: case 'q2':") as caught:
+        load_dataset(path)
+    assert "tags" in str(caught.value)
+    assert "non-empty" in str(caught.value)
+
+
+def test_tags_must_be_a_list_of_strings(tmp_path):
+    path = tmp_path / "cases.jsonl"
+    path.write_text(
+        '{"id": "q1", "query": "a", "relevant": ["d1"], "tags": "billing"}\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(DatasetError, match=r"case 'q1':") as caught:
+        load_dataset(path)
+    assert "list" in str(caught.value)
+
+
+def test_duplicate_tag_is_rejected(tmp_path):
+    path = tmp_path / "cases.jsonl"
+    path.write_text(
+        '{"id": "q1", "query": "a", "relevant": ["d1"], "tags": ["billing", " billing "]}\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(DatasetError, match=r"case 'q1':.*duplicate tag 'billing'"):
+        load_dataset(path)
