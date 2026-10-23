@@ -6,7 +6,7 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
-from retrieval_gate.errors import ConfigError
+from retrieval_gate.errors import ConfigError, RetrieverResponseError
 
 
 def load_retriever(spec: str) -> Callable:
@@ -51,6 +51,8 @@ async def call_retriever(fn: Callable, query: str, k: int, case_id: str) -> list
         value = fn(query, k)
         if inspect.isawaitable(value):
             value = await value
+    except RetrieverResponseError as exc:
+        raise ConfigError(f"case {case_id}: {exc}") from exc
     except ConfigError:
         raise
     except Exception as exc:

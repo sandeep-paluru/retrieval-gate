@@ -6,9 +6,10 @@ description: >
 inputs:
   config:
     description: >
-      Path to a YAML config. Keys are dataset, retriever, k, fail_under,
-      fail_under_tag, baseline, and max_drop. Paths inside the file are
-      relative to the file.
+      Path to a YAML config. Keys are dataset, retriever, retriever_url,
+      method, headers, timeout, concurrency, results_key, id_field, k,
+      fail_under, fail_under_tag, baseline, and max_drop. Paths inside
+      the file are relative to the file.
     required: false
     default: ""
   dataset:
