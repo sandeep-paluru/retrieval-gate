@@ -8,6 +8,16 @@ import yaml
 
 from retrieval_gate.dataset import load_dataset
 from retrieval_gate.errors import ConfigError, DatasetError
+from retrieval_gate.http_retriever import (
+    DEFAULT_CONCURRENCY,
+    DEFAULT_ID_FIELD,
+    DEFAULT_TIMEOUT,
+    build_http_retriever,
+    checked_concurrency,
+    checked_timeout,
+    normalize_method,
+    public_url,
+)
 from retrieval_gate.metrics import METRIC_NAMES
 from retrieval_gate.report import (
     build_report,
@@ -36,11 +46,27 @@ app = typer.Typer(
 _CONFIG_KEYS = {
     "dataset",
     "retriever",
+    "retriever_url",
+    "method",
+    "headers",
+    "timeout",
+    "concurrency",
+    "results_key",
+    "id_field",
     "k",
     "fail_under",
     "fail_under_tag",
     "baseline",
     "max_drop",
+}
+
+_HTTP_FLAGS = {
+    "method": "--method",
+    "header": "--header",
+    "timeout": "--timeout",
+    "concurrency": "--concurrency",
+    "results_key": "--results-key",
+    "id_field": "--id-field",
 }
 
 
@@ -61,6 +87,47 @@ def run(
         "--retriever",
         "-r",
         help="Import path of the retriever, as module.submodule:function.",
+    ),
+    retriever_url: str | None = typer.Option(
+        None,
+        "--retriever-url",
+        help="Score this HTTP service. POST JSON with query and k by default.",
+    ),
+    method: str | None = typer.Option(
+        None,
+        "--method",
+        help="HTTP method for --retriever-url: get or post. Defaults to post.",
+    ),
+    header: list[str] | None = typer.Option(
+        None,
+        "--header",
+        help=(
+            "Header for --retriever-url, as 'Name: Value'. Repeatable. "
+            "${ENV_VAR} in the value is expanded. The value is not printed."
+        ),
+    ),
+    timeout: float | None = typer.Option(
+        None,
+        "--timeout",
+        help=(
+            "Per-request timeout in seconds for --retriever-url. "
+            f"Defaults to {DEFAULT_TIMEOUT:g}."
+        ),
+    ),
+    concurrency: int | None = typer.Option(
+        None,
+        "--concurrency",
+        help=f"Max in-flight HTTP requests. Defaults to {DEFAULT_CONCURRENCY}.",
+    ),
+    results_key: str | None = typer.Option(
+        None,
+        "--results-key",
+        help="JSON key that holds the result list. Defaults to results, then documents, then hits.",
+    ),
+    id_field: str | None = typer.Option(
+        None,
+        "--id-field",
+        help="Object field that holds a document id. Defaults to id.",
     ),
     k: int | None = typer.Option(
         None,
@@ -96,8 +163,9 @@ def run(
         None,
         "--config",
         help=(
-            "YAML file with dataset, retriever, k, fail_under, fail_under_tag, "
-            "baseline, and max_drop."
+            "YAML file with dataset, retriever or retriever_url, k, fail_under, "
+            "fail_under_tag, baseline, and max_drop. HTTP runs also read method, "
+            "headers, timeout, concurrency, results_key, and id_field."
         ),
     ),
     baseline: Path | None = typer.Option(
@@ -117,7 +185,6 @@ def run(
         fmt = _checked_format(report_format)
         cfg = load_config(config) if config is not None else _empty_config()
         chosen_dataset = dataset if dataset is not None else cfg["dataset"]
-        chosen_retriever = retriever if retriever is not None else cfg["retriever"]
         chosen_k = _choose_k(k, cfg["k"])
         thresholds = parse_fail_under(fail_under) if fail_under else cfg["thresholds"]
         tag_thresholds = (
@@ -127,20 +194,29 @@ def run(
         chosen_drop = _choose_max_drop(max_drop, cfg["max_drop"], chosen_baseline)
         if chosen_dataset is None:
             raise ConfigError("pass --dataset or set dataset in --config")
-        if not chosen_retriever:
-            raise ConfigError("pass --retriever or set retriever in --config")
         if chosen_k < 1:
             raise ConfigError("k must be >= 1")
+        fn, retriever_name, request_concurrency = _prepare_retriever(
+            retriever,
+            retriever_url,
+            method,
+            header,
+            timeout,
+            concurrency,
+            results_key,
+            id_field,
+            cfg,
+        )
         cases = load_dataset(chosen_dataset)
-        fn = load_retriever(chosen_retriever)
         report = build_report(
             cases,
             fn,
             chosen_k,
             dataset=str(chosen_dataset),
-            retriever_name=chosen_retriever,
+            retriever_name=retriever_name,
             thresholds=thresholds,
             tag_thresholds=tag_thresholds,
+            concurrency=request_concurrency,
         )
         baseline_report = (
             load_report(chosen_baseline) if chosen_baseline is not None else None
@@ -330,13 +406,102 @@ def _threshold_value(flag: str, item: str, name: str, raw: str) -> float:
     return value
 
 
+def _prepare_retriever(
+    retriever: str | None,
+    retriever_url: str | None,
+    method: str | None,
+    header: list[str] | None,
+    timeout: float | None,
+    concurrency: int | None,
+    results_key: str | None,
+    id_field: str | None,
+    cfg: dict,
+) -> tuple:
+    """Pick the import path or the HTTP service and return ``(fn, name, concurrency)``."""
+
+    if retriever and retriever_url:
+        raise ConfigError("pass --retriever or --retriever-url, not both")
+
+    from_config = retriever is None and retriever_url is None
+    if retriever:
+        spec, url = retriever, None
+    elif retriever_url:
+        spec, url = None, retriever_url
+    else:
+        spec, url = cfg["retriever"], cfg["retriever_url"]
+        if spec and url:
+            raise ConfigError("config sets both retriever and retriever_url")
+
+    if spec is None and url is None:
+        raise ConfigError("pass --retriever or --retriever-url, or set one in --config")
+
+    cli_http = _first_set(
+        ("method", method),
+        ("header", header),
+        ("timeout", timeout),
+        ("concurrency", concurrency),
+        ("results_key", results_key),
+        ("id_field", id_field),
+    )
+    if spec is not None:
+        if cli_http:
+            raise ConfigError(f"{_HTTP_FLAGS[cli_http]} requires --retriever-url")
+        if from_config:
+            config_http = _first_set(
+                ("method", cfg["method"]),
+                ("headers", cfg["headers"]),
+                ("timeout", cfg["timeout"]),
+                ("concurrency", cfg["concurrency"]),
+                ("results_key", cfg["results_key"]),
+                ("id_field", cfg["id_field"]),
+            )
+            if config_http:
+                raise ConfigError(f"config key {config_http} requires retriever_url")
+        return load_retriever(spec), spec, 1
+
+    chosen_method = method if method is not None else cfg["method"]
+    chosen_headers = list(header) if header else list(cfg["headers"])
+    chosen_timeout = timeout if timeout is not None else cfg["timeout"]
+    chosen_concurrency = concurrency if concurrency is not None else cfg["concurrency"]
+    chosen_results_key = results_key if results_key is not None else cfg["results_key"]
+    chosen_id_field = id_field if id_field is not None else cfg["id_field"]
+    fn = build_http_retriever(
+        url,
+        method=chosen_method or "POST",
+        headers=chosen_headers,
+        timeout=DEFAULT_TIMEOUT if chosen_timeout is None else chosen_timeout,
+        results_key=chosen_results_key,
+        id_field=chosen_id_field or DEFAULT_ID_FIELD,
+    )
+    limit = DEFAULT_CONCURRENCY if chosen_concurrency is None else chosen_concurrency
+    limit = checked_concurrency(limit)
+    return fn, public_url(url), limit
+
+
+def _first_set(*pairs: tuple[str, object]) -> str | None:
+    for name, value in pairs:
+        if _is_set(value):
+            return name
+    return None
+
+
+def _is_set(value: object) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, (list, tuple, str)) and len(value) == 0:
+        return False
+    return True
+
+
 def load_config(path: Path) -> dict:
     """Load run settings from a YAML file.
 
     Paths are resolved relative to the config file. ``fail_under`` may be
     a mapping of metric name to limit, or a list of ``name=value`` strings.
     ``fail_under_tag`` may be a mapping of tag to metric limits, or a list
-    of ``tag:metric=value`` strings.
+    of ``tag:metric=value`` strings. ``retriever_url`` calls an HTTP
+    service. ``method``, ``headers``, ``timeout``, ``concurrency``,
+    ``results_key``, and ``id_field`` apply to that service.
     """
 
     if not path.is_file():
@@ -358,6 +523,13 @@ def load_config(path: Path) -> dict:
     return {
         "dataset": _config_path(path, raw.get("dataset"), "dataset"),
         "retriever": _config_text(path, raw.get("retriever"), "retriever"),
+        "retriever_url": _config_text(path, raw.get("retriever_url"), "retriever_url"),
+        "method": _config_method(path, raw.get("method")),
+        "headers": _config_headers(path, raw.get("headers")),
+        "timeout": _config_timeout(path, raw.get("timeout")),
+        "concurrency": _config_concurrency(path, raw.get("concurrency")),
+        "results_key": _config_text(path, raw.get("results_key"), "results_key"),
+        "id_field": _config_text(path, raw.get("id_field"), "id_field"),
         "k": _config_k(path, raw.get("k")),
         "baseline": _config_path(path, raw.get("baseline"), "baseline"),
         "max_drop": _config_max_drop(path, raw.get("max_drop")),
@@ -370,6 +542,13 @@ def _empty_config() -> dict:
     return {
         "dataset": None,
         "retriever": None,
+        "retriever_url": None,
+        "method": None,
+        "headers": [],
+        "timeout": None,
+        "concurrency": None,
+        "results_key": None,
+        "id_field": None,
         "k": None,
         "baseline": None,
         "max_drop": None,
@@ -419,6 +598,54 @@ def _config_text(path: Path, value: object, key: str) -> str | None:
     if not isinstance(value, str) or not value.strip():
         raise ConfigError(f"{path}: {key} must be a string")
     return value.strip()
+
+
+def _config_method(path: Path, value: object) -> str | None:
+    text = _config_text(path, value, "method")
+    if text is None:
+        return None
+    try:
+        return normalize_method(text)
+    except ConfigError as exc:
+        raise ConfigError(f"{path}: {exc}") from exc
+
+
+def _config_headers(path: Path, value: object) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        items = []
+        for item in value:
+            if not isinstance(item, str):
+                raise ConfigError(f"{path}: headers entries must be 'Name: Value' strings")
+            items.append(item)
+        return items
+    if isinstance(value, dict):
+        items = []
+        for name, raw in value.items():
+            if not isinstance(name, str) or not isinstance(raw, str):
+                raise ConfigError(f"{path}: headers values must be strings")
+            items.append(f"{name}: {raw}")
+        return items
+    raise ConfigError(f"{path}: headers must be a list or a mapping")
+
+
+def _config_timeout(path: Path, value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        return checked_timeout(value)
+    except ConfigError as exc:
+        raise ConfigError(f"{path}: {exc}") from exc
+
+
+def _config_concurrency(path: Path, value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        return checked_concurrency(value)
+    except ConfigError as exc:
+        raise ConfigError(f"{path}: {exc}") from exc
 
 
 def _config_k(path: Path, value: object) -> int | None:

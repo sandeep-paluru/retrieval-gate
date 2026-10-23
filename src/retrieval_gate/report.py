@@ -25,6 +25,7 @@ def build_report(
     retriever_name: str,
     thresholds: dict[str, float],
     tag_thresholds: dict[str, dict[str, float]] | None = None,
+    concurrency: int = 1,
 ) -> dict:
     """Score every case and average the metrics.
 
@@ -36,14 +37,19 @@ def build_report(
     case is counted in each of its tags. Cases with no tags are left out
     of that table. ``tag_thresholds`` maps a tag to metric limits and uses
     the same strict-below rule.
+
+    Calls run one at a time when ``concurrency`` is 1. A larger value
+    keeps that many calls in flight. Import-path runs leave it at 1.
     """
 
     if k < 1:
         raise ConfigError("k must be >= 1")
+    if isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency < 1:
+        raise ConfigError("concurrency must be an integer >= 1")
     if tag_thresholds is None:
         tag_thresholds = {}
     _require_tagged_cases(cases, tag_thresholds)
-    retrieved_lists = asyncio.run(_retrieve_all(retriever, cases, k))
+    retrieved_lists = asyncio.run(_retrieve_all(retriever, cases, k, concurrency))
     results = []
     raw_scores = []
     for case, retrieved in zip(cases, retrieved_lists, strict=True):
@@ -153,11 +159,32 @@ def _require_tagged_cases(cases: list[Case], thresholds: dict[str, dict[str, flo
     raise ConfigError(f"no cases tagged {names}")
 
 
-async def _retrieve_all(retriever: Callable, cases: list[Case], k: int) -> list[list[str]]:
-    lists = []
-    for case in cases:
-        lists.append(await call_retriever(retriever, case.query, k, case.id))
-    return lists
+async def _retrieve_all(
+    retriever: Callable,
+    cases: list[Case],
+    k: int,
+    concurrency: int,
+) -> list[list[str]]:
+    if concurrency <= 1:
+        lists = []
+        for case in cases:
+            lists.append(await call_retriever(retriever, case.query, k, case.id))
+        return lists
+
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def one(case: Case) -> list[str] | ConfigError:
+        async with semaphore:
+            try:
+                return await call_retriever(retriever, case.query, k, case.id)
+            except ConfigError as exc:
+                return exc
+
+    retrieved = await asyncio.gather(*(one(case) for case in cases))
+    for item in retrieved:
+        if isinstance(item, ConfigError):
+            raise item
+    return retrieved
 
 
 def format_report(report: dict) -> str:

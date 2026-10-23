@@ -7,3 +7,11 @@ class DatasetError(Exception):
 
 class ConfigError(Exception):
     """The retriever, thresholds, or a report file cannot be used."""
+
+
+class RetrieverResponseError(Exception):
+    """A retriever response that cannot be scored.
+
+    The message is printed. It must not include header values, userinfo,
+    or the query string.
+    """

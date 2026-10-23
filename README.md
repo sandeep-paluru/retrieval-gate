@@ -1,6 +1,6 @@
 # retrieval-gate
 
-retrieval-gate scores the retrieval step of a RAG pipeline against a labeled query set. You provide queries and the document ids that should come back. It calls your retriever, reports hit rate, recall, precision, MRR, and nDCG, and exits non-zero when a score falls under a threshold you set. The core makes no model call and no network call, so a CI job can run it the way it runs a coverage check.
+retrieval-gate scores the retrieval step of a RAG pipeline against a labeled query set. You provide queries and the document ids that should come back. It calls your retriever, reports hit rate, recall, precision, MRR, and nDCG, and exits non-zero when a score falls under a threshold you set. Passed an import path, it makes no model call and no network call, so a CI job can run it the way it runs a coverage check. `--retriever-url` opts in to calling an HTTP service.
 
 ## Install
 
@@ -75,6 +75,62 @@ retrieval-gate run \
 `--retriever` is an import path, `package.module:function`. The current working directory is put on `sys.path`, so run the command from the directory that contains that module (the repo root for the example).
 
 The callable is `(query: str, k: int)`. It can be sync or async. Return a list of document id strings, or a list of dicts or objects with an `id` field.
+
+## HTTP retriever
+
+`--retriever-url` scores a search service. The import path stays local and still makes no network call. Pass one of the two, not both.
+
+The default request is a POST with this JSON body:
+
+```json
+{"query": "reset password", "k": 5}
+```
+
+`--method get` sends `query` and `k` as query parameters. `--header` can be repeated, as `Name: Value`. Write `${ENV_VAR}` in the value and the variable is read from the environment when the run starts. The header value is sent to the service. It is left out of the report and out of error text.
+
+A 2xx body can be a JSON list of id strings or objects. It can also be an object with that list under `results`, `documents`, or `hits`, in that order. `--results-key` picks a different key. `--id-field` picks the id field on each object and defaults to `id`. A status that is not 2xx, or a body that is not one of those shapes, exits 2 and names the case id.
+
+`--timeout` is the per-request limit in seconds and defaults to 10. `--concurrency` is how many requests run at once and defaults to 4.
+
+The report line that names the retriever prints the URL with userinfo and the query string removed, so a token there is not copied into the report or the JSON file.
+
+The YAML config takes the same settings: `retriever_url`, `method`, `headers`, `timeout`, `concurrency`, `results_key`, and `id_field`. `headers` is a list of `Name: Value` strings, or a mapping of name to value:
+
+```yaml
+retriever_url: http://localhost:8000/search
+method: post
+timeout: 10
+concurrency: 4
+headers:
+  Authorization: Bearer ${SEARCH_TOKEN}
+```
+
+`examples/fastapi_service.py` serves the example BM25 retriever. From the repository root:
+
+```bash
+pip install -e ".[examples]"
+uvicorn examples.fastapi_service:app --port 8000
+```
+
+```bash
+retrieval-gate run \
+  --dataset examples/cases.jsonl \
+  --retriever-url http://localhost:8000/search \
+  --k 5 \
+  --fail-under recall=0.8
+```
+
+POST `/search` reads the JSON body above. GET `/search` reads `query` and `k`. Both return `{"results": [{"id": "d01"}, ...]}`.
+
+A run that keeps the token in the environment:
+
+```bash
+retrieval-gate run \
+  --dataset examples/cases.jsonl \
+  --retriever-url http://localhost:8000/search \
+  --header "Authorization: Bearer ${SEARCH_TOKEN}" \
+  --k 5
+```
 
 ## Dataset format
 
@@ -216,4 +272,3 @@ jobs:
 ## Roadmap
 
 - Adapters for LangChain and LlamaIndex retrievers
-- An HTTP retriever for FastAPI services
