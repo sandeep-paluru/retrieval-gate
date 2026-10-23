@@ -25,6 +25,13 @@ examples = [
     "fastapi>=0.110",
     "uvicorn>=0.27",
 ]
+langchain = [
+    "langchain-core>=0.3",
+    "numpy>=1.26",
+]
+llamaindex = [
+    "llama-index-core>=0.12",
+]
 
 [project.scripts]
 retrieval-gate = "retrieval_gate.cli:main"

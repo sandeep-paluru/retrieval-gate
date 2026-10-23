@@ -6,6 +6,7 @@ from pathlib import Path
 import typer
 import yaml
 
+from retrieval_gate.adapters import normalize_adapter
 from retrieval_gate.dataset import load_dataset
 from retrieval_gate.errors import ConfigError, DatasetError
 from retrieval_gate.http_retriever import (
@@ -53,6 +54,7 @@ _CONFIG_KEYS = {
     "concurrency",
     "results_key",
     "id_field",
+    "adapter",
     "k",
     "fail_under",
     "fail_under_tag",
@@ -66,7 +68,6 @@ _HTTP_FLAGS = {
     "timeout": "--timeout",
     "concurrency": "--concurrency",
     "results_key": "--results-key",
-    "id_field": "--id-field",
 }
 
 
@@ -86,7 +87,15 @@ def run(
         None,
         "--retriever",
         "-r",
-        help="Import path of the retriever, as module.submodule:function.",
+        help=(
+            "Import path, as module.submodule:attribute. A (query, k) function, "
+            "or a LangChain or LlamaIndex retriever."
+        ),
+    ),
+    adapter: str | None = typer.Option(
+        None,
+        "--adapter",
+        help="How to call --retriever: auto, langchain, or llamaindex. Defaults to auto.",
     ),
     retriever_url: str | None = typer.Option(
         None,
@@ -127,7 +136,11 @@ def run(
     id_field: str | None = typer.Option(
         None,
         "--id-field",
-        help="Object field that holds a document id. Defaults to id.",
+        help=(
+            "Where to read a document id. HTTP bodies use this object field "
+            "(default id). LangChain reads Document.id unless this names a metadata key. "
+            "LlamaIndex reads node_id unless this is ref_doc_id or a metadata key."
+        ),
     ),
     k: int | None = typer.Option(
         None,
@@ -164,8 +177,9 @@ def run(
         "--config",
         help=(
             "YAML file with dataset, retriever or retriever_url, k, fail_under, "
-            "fail_under_tag, baseline, and max_drop. HTTP runs also read method, "
-            "headers, timeout, concurrency, results_key, and id_field."
+            "fail_under_tag, baseline, and max_drop. Import-path runs also read "
+            "adapter and id_field. HTTP runs also read method, headers, timeout, "
+            "concurrency, results_key, and id_field."
         ),
     ),
     baseline: Path | None = typer.Option(
@@ -199,6 +213,7 @@ def run(
         fn, retriever_name, request_concurrency = _prepare_retriever(
             retriever,
             retriever_url,
+            adapter,
             method,
             header,
             timeout,
@@ -409,6 +424,7 @@ def _threshold_value(flag: str, item: str, name: str, raw: str) -> float:
 def _prepare_retriever(
     retriever: str | None,
     retriever_url: str | None,
+    adapter: str | None,
     method: str | None,
     header: list[str] | None,
     timeout: float | None,
@@ -435,13 +451,15 @@ def _prepare_retriever(
     if spec is None and url is None:
         raise ConfigError("pass --retriever or --retriever-url, or set one in --config")
 
+    if url is not None and (adapter is not None or (from_config and cfg["adapter"] is not None)):
+        raise ConfigError("adapter requires a retriever import path")
+
     cli_http = _first_set(
         ("method", method),
         ("header", header),
         ("timeout", timeout),
         ("concurrency", concurrency),
         ("results_key", results_key),
-        ("id_field", id_field),
     )
     if spec is not None:
         if cli_http:
@@ -453,11 +471,30 @@ def _prepare_retriever(
                 ("timeout", cfg["timeout"]),
                 ("concurrency", cfg["concurrency"]),
                 ("results_key", cfg["results_key"]),
-                ("id_field", cfg["id_field"]),
             )
             if config_http:
                 raise ConfigError(f"config key {config_http} requires retriever_url")
-        return load_retriever(spec), spec, 1
+        if adapter is not None:
+            chosen_adapter = normalize_adapter(adapter)
+        elif from_config:
+            chosen_adapter = cfg["adapter"]
+        else:
+            chosen_adapter = None
+        if id_field is not None:
+            chosen_id_field = id_field
+        elif from_config:
+            chosen_id_field = cfg["id_field"]
+        else:
+            chosen_id_field = None
+        return (
+            load_retriever(
+                spec,
+                adapter=chosen_adapter or "auto",
+                id_field=chosen_id_field,
+            ),
+            spec,
+            1,
+        )
 
     chosen_method = method if method is not None else cfg["method"]
     chosen_headers = list(header) if header else list(cfg["headers"])
@@ -499,9 +536,11 @@ def load_config(path: Path) -> dict:
     Paths are resolved relative to the config file. ``fail_under`` may be
     a mapping of metric name to limit, or a list of ``name=value`` strings.
     ``fail_under_tag`` may be a mapping of tag to metric limits, or a list
-    of ``tag:metric=value`` strings. ``retriever_url`` calls an HTTP
+    of ``tag:metric=value`` strings.     ``retriever_url`` calls an HTTP
     service. ``method``, ``headers``, ``timeout``, ``concurrency``,
-    ``results_key``, and ``id_field`` apply to that service.
+    and ``results_key`` apply to that service. ``id_field`` applies to
+    the service and to a LangChain or LlamaIndex retriever. ``adapter``
+    is auto, langchain, or llamaindex.
     """
 
     if not path.is_file():
@@ -530,6 +569,7 @@ def load_config(path: Path) -> dict:
         "concurrency": _config_concurrency(path, raw.get("concurrency")),
         "results_key": _config_text(path, raw.get("results_key"), "results_key"),
         "id_field": _config_text(path, raw.get("id_field"), "id_field"),
+        "adapter": _config_adapter(path, raw.get("adapter")),
         "k": _config_k(path, raw.get("k")),
         "baseline": _config_path(path, raw.get("baseline"), "baseline"),
         "max_drop": _config_max_drop(path, raw.get("max_drop")),
@@ -549,6 +589,7 @@ def _empty_config() -> dict:
         "concurrency": None,
         "results_key": None,
         "id_field": None,
+        "adapter": None,
         "k": None,
         "baseline": None,
         "max_drop": None,
@@ -590,6 +631,16 @@ def _config_path(path: Path, value: object, key: str) -> Path | None:
     if not candidate.is_absolute():
         candidate = path.parent / candidate
     return candidate
+
+
+def _config_adapter(path: Path, value: object) -> str | None:
+    text = _config_text(path, value, "adapter")
+    if text is None:
+        return None
+    try:
+        return normalize_adapter(text)
+    except ConfigError as exc:
+        raise ConfigError(f"{path}: {exc}") from exc
 
 
 def _config_text(path: Path, value: object, key: str) -> str | None:

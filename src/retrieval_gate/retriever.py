@@ -6,14 +6,22 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
+from retrieval_gate.adapters import adapt_retriever
 from retrieval_gate.errors import ConfigError, RetrieverResponseError
 
 
-def load_retriever(spec: str) -> Callable:
-    """Import ``module.submodule:function``.
+def load_retriever(
+    spec: str,
+    *,
+    adapter: str = "auto",
+    id_field: str | None = None,
+) -> Callable:
+    """Import ``module.submodule:attribute`` and return a ``(query, k)`` callable.
 
-    The current working directory is inserted on ``sys.path`` so a local
-    module resolves the same way it would under pytest.
+    The attribute can be a function, a LangChain retriever or vector store,
+    or a LlamaIndex retriever or index. The current working directory is
+    inserted on ``sys.path`` so a local module resolves the same way it
+    would under pytest.
     """
 
     if spec.count(":") != 1:
@@ -32,12 +40,10 @@ def load_retriever(spec: str) -> Callable:
             f"could not import {module_name!r} ({type(exc).__name__}: {exc})"
         ) from exc
     try:
-        fn = getattr(module, func_name)
+        obj = getattr(module, func_name)
     except AttributeError as exc:
         raise ConfigError(f"{module_name!r} has no attribute {func_name!r}") from exc
-    if not callable(fn):
-        raise ConfigError(f"{spec} is not callable")
-    return fn
+    return adapt_retriever(obj, adapter=adapter, id_field=id_field, label=spec)
 
 
 async def call_retriever(fn: Callable, query: str, k: int, case_id: str) -> list[str]:
