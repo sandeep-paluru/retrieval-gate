@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "retrieval-gate"
-version = "0.2.0"
+version = "0.3.0"
 description = "Score a retriever against labeled queries and fail CI when metrics drop."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -24,6 +24,13 @@ dev = [
 examples = [
     "fastapi>=0.110",
     "uvicorn>=0.27",
+]
+langchain = [
+    "langchain-core>=0.3",
+    "numpy>=1.26",
+]
+llamaindex = [
+    "llama-index-core>=0.12",
 ]
 
 [project.scripts]

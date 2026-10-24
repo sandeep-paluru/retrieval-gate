@@ -72,9 +72,9 @@ retrieval-gate run \
   --json report.json
 ```
 
-`--retriever` is an import path, `package.module:function`. The current working directory is put on `sys.path`, so run the command from the directory that contains that module (the repo root for the example).
+`--retriever` is an import path, `package.module:attribute`. The current working directory is put on `sys.path`, so run the command from the directory that contains that module (the repo root for the example).
 
-The callable is `(query: str, k: int)`. It can be sync or async. Return a list of document id strings, or a list of dicts or objects with an `id` field.
+The callable is `(query: str, k: int)`. It can be sync or async. Return a list of document id strings, or a list of dicts or objects with an `id` field. A LangChain or LlamaIndex retriever is accepted too. See LangChain and LlamaIndex.
 
 ## HTTP retriever
 
@@ -130,6 +130,47 @@ retrieval-gate run \
   --retriever-url http://localhost:8000/search \
   --header "Authorization: Bearer ${SEARCH_TOKEN}" \
   --k 5
+```
+
+## LangChain and LlamaIndex
+
+`--retriever` can point at a LangChain retriever or vector store, or a LlamaIndex retriever or index. The type is detected. `--adapter langchain` or `--adapter llamaindex` forces one. Both libraries are optional:
+
+```bash
+pip install "retrieval-gate[langchain]"
+pip install "retrieval-gate[llamaindex]"
+```
+
+From the repository root, after `pip install -e ".[langchain]"`:
+
+```bash
+retrieval-gate run \
+  --dataset examples/cases.jsonl \
+  --retriever examples.langchain_retriever:store \
+  --k 5
+```
+
+`examples/langchain_retriever.py` builds an in-memory store with a deterministic embedding, so the run needs no API key and no network call.
+
+LlamaIndex, after `pip install -e ".[llamaindex]"`:
+
+```bash
+retrieval-gate run \
+  --dataset examples/cases.jsonl \
+  --retriever examples.llamaindex_retriever:index \
+  --k 5
+```
+
+Document ids come from `Document.id` for LangChain and from `node.node_id` for LlamaIndex. `--id-field source` reads a metadata key instead. For LlamaIndex, `--id-field ref_doc_id` reads the source document id. A result with no id exits 2.
+
+`k` is passed through as LangChain `search_kwargs` or vector store `k`, and as LlamaIndex `similarity_top_k`. Results are truncated to `k`. Async `ainvoke` and `aretrieve` are used when the object has them.
+
+The YAML config takes `adapter` and `id_field` next to `retriever`:
+
+```yaml
+retriever: examples.langchain_retriever:store
+adapter: langchain
+k: 5
 ```
 
 ## Dataset format
@@ -268,7 +309,3 @@ jobs:
 ```
 
 `examples/gate.yml` holds the retriever, cutoff, and thresholds for the checked-in example. Paths in that file are relative to the file. The `dataset` and `baseline` inputs override it when you set them. In another repository, replace `./` with `sandeep-paluru/retrieval-gate@<ref>`. The step fails on a missed threshold or a baseline drop, after the summary is written.
-
-## Roadmap
-
-- Adapters for LangChain and LlamaIndex retrievers
