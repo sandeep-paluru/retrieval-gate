@@ -7,6 +7,12 @@ import typer
 import yaml
 
 from retrieval_gate.adapters import normalize_adapter
+from retrieval_gate.bootstrap import (
+    DEFAULT_BOOTSTRAP_CONFIDENCE,
+    DEFAULT_BOOTSTRAP_SEED,
+    format_bootstrap,
+    paired_bootstrap,
+)
 from retrieval_gate.dataset import load_dataset
 from retrieval_gate.errors import ConfigError, DatasetError
 from retrieval_gate.http_retriever import (
@@ -297,17 +303,59 @@ def compare(
         "--fail-on-tag-regression",
         help="Exit 1 when any tag metric drops by more than --max-drop. Off by default.",
     ),
+    bootstrap_samples: int = typer.Option(
+        0,
+        "--bootstrap",
+        help="Paired resamples of shared cases. 0 skips the check. 2000 is the suggested count.",
+    ),
+    confidence: float = typer.Option(
+        DEFAULT_BOOTSTRAP_CONFIDENCE,
+        "--confidence",
+        help="Confidence level for the bootstrap interval, above 0 and below 1. Default 0.95.",
+    ),
+    seed: int = typer.Option(
+        DEFAULT_BOOTSTRAP_SEED,
+        "--seed",
+        help="Random seed for the bootstrap. Default 0 so repeated runs match.",
+    ),
+    fail_on_significant_drop: bool = typer.Option(
+        False,
+        "--fail-on-significant-drop",
+        help=(
+            "Exit 1 when the whole bootstrap interval is below -max-drop. "
+            "Off by default. Applies only when --bootstrap is set."
+        ),
+    ),
 ) -> None:
-    """Compare two JSON reports and fail on a regression."""
+    """Compare two JSON reports and fail on a regression.
+
+    ``--bootstrap`` resamples cases shared by both reports. It is off by
+    default. ``--fail-on-significant-drop`` is what lets that interval
+    change the exit code.
+    """
 
     try:
         fmt = _checked_format(report_format)
         _checked_max_drop(max_drop)
         _checked_show_cases(show_cases)
+        _checked_bootstrap(bootstrap_samples)
+        _checked_confidence(confidence)
+        _checked_seed(seed)
         before = load_report(baseline)
         after = load_report(current)
         diff = case_diff(before, after)
         tags = tag_diff(before, after, max_drop)
+        bootstrap = None
+        if bootstrap_samples > 0:
+            bootstrap = paired_bootstrap(
+                before,
+                after,
+                samples=bootstrap_samples,
+                confidence=confidence,
+                seed=seed,
+                max_drop=max_drop,
+                checked=fail_on_significant_drop,
+            )
         if fmt == "markdown":
             text = format_markdown(
                 after,
@@ -337,7 +385,11 @@ def compare(
         else:
             case_failed = False
         tag_failed = bool(fail_on_tag_regression and tags["regressed"])
-        _emit(f"{text}\n\n{section}", output)
+        parts = [text]
+        if bootstrap is not None:
+            parts.append(format_bootstrap(bootstrap, markdown=(fmt == "markdown")))
+        parts.append(section)
+        _emit("\n\n".join(parts), output)
         if json_output is not None:
             write_report(
                 json_output,
@@ -350,11 +402,18 @@ def compare(
                     diff,
                     show_cases,
                     check_tags=fail_on_tag_regression,
+                    bootstrap=bootstrap,
                 ),
             )
     except (DatasetError, ConfigError) as exc:
         _fail(str(exc))
-    if failed or case_failed or tag_failed:
+    bootstrap_failed = bool(
+        fail_on_significant_drop
+        and bootstrap is not None
+        and bootstrap["available"]
+        and bootstrap["significant"]
+    )
+    if failed or case_failed or tag_failed or bootstrap_failed:
         raise typer.Exit(code=1)
 
 
@@ -783,6 +842,26 @@ def _checked_max_drop(value: float) -> float:
 def _checked_show_cases(value: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ConfigError("--show-cases must be an integer >= 0")
+    return value
+
+
+def _checked_bootstrap(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ConfigError("--bootstrap must be an integer >= 0")
+    return value
+
+
+def _checked_confidence(value: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ConfigError("--confidence must be greater than 0 and less than 1")
+    if not 0.0 < float(value) < 1.0:
+        raise ConfigError("--confidence must be greater than 0 and less than 1")
+    return float(value)
+
+
+def _checked_seed(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError("--seed must be an integer")
     return value
 
 

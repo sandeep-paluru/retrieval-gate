@@ -229,10 +229,17 @@ It also lists cases that got worse, matched by id. A case is listed when recall 
 
 When both reports have per-tag scores, compare also prints each tag's delta. A baseline written before tags existed prints a note and does not fail. `--fail-on-tag-regression` applies `--max-drop` to every tag metric and exits 1 on a drop. It is off by default, so a drop in one tag does not change the exit code. Tags found in only one report are listed and do not fail the command.
 
+On a small labeled set, a 0.02 drop in recall or nDCG is often just which queries are in the file. `--bootstrap N` resamples the cases shared by both reports. For hit rate, recall, precision, MRR, and nDCG it prints the mean of current minus baseline, a confidence interval, and a two-sided p-value for a mean change of zero. Omit the flag, or pass 0, and the check stays off. Use 2000 resamples when you want an interval. `--confidence` defaults to 0.95. `--seed` defaults to 0, so the same two files print the same interval on every run.
+
+`--fail-on-significant-drop` exits 1 when the whole interval is below `-max-drop`. The upper bound is the mildest value in the interval, and it has to be a larger drop than the limit. An upper bound equal to `-max-drop` passes. That flag reads the interval, and it does nothing unless `--bootstrap` is set. Leaving both off keeps the existing exit behavior. The aggregate `--max-drop` gate still runs either way.
+
+The bootstrap mean uses paired cases, so it can differ from the headline delta when the reports do not list the same cases. A case missing any of the five metrics is skipped. Per-tag scores are not resampled. A report written before per-case results existed prints a note and skips the check. The block is in the text report, in `--format markdown`, and in the `--json` file.
+
 ```bash
 retrieval-gate compare baseline.json report.json --max-drop 0.02
 retrieval-gate compare baseline.json report.json --show-cases 10 --json compare.json
 retrieval-gate compare baseline.json report.json --fail-on-tag-regression
+retrieval-gate compare baseline.json report.json --bootstrap 2000 --fail-on-significant-drop
 ```
 
 A GitHub Actions job that regenerates the report and compares it:

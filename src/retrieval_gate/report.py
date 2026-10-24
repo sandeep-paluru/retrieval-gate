@@ -639,6 +639,7 @@ def comparison_payload(
     limit: int,
     *,
     check_tags: bool = False,
+    bootstrap: dict | None = None,
 ) -> dict:
     """JSON body for ``compare --json``.
 
@@ -648,6 +649,9 @@ def comparison_payload(
 
     ``tags.regressed`` lists tag metrics that fell by more than ``max_drop``.
     ``tags.checked`` is true when that list is allowed to fail the command.
+
+    ``bootstrap`` is included only when a resample was requested.
+    ``bootstrap.checked`` is true when a significant drop can fail the command.
     """
 
     failed = regressed_metrics(baseline, current, max_drop)
@@ -674,7 +678,7 @@ def comparison_payload(
     if diff["message"]:
         cases["message"] = diff["message"]
     tags = tag_diff(baseline, current, max_drop)
-    return {
+    payload = {
         "baseline": str(baseline_path),
         "current": str(current_path),
         "k": {"baseline": _k_value(baseline), "current": _k_value(current)},
@@ -684,6 +688,9 @@ def comparison_payload(
         "cases": cases,
         "tags": _public_tag_diff(tags, check_tags),
     }
+    if bootstrap is not None:
+        payload["bootstrap"] = bootstrap
+    return payload
 
 
 def tag_diff(baseline: dict, current: dict, max_drop: float) -> dict:
