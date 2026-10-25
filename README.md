@@ -272,6 +272,117 @@ worst misses at k=10
 none
 ```
 
+## Latency
+
+Every scored retriever call is timed with `time.perf_counter`. The report adds the mean, p50, p95, p99, and max, in milliseconds. There is one sample per case. `--k-values` still calls the retriever once, at the largest cutoff, so it still records one latency per case. With `--concurrency`, each HTTP request is timed on its own. Time spent waiting for a free slot is not included.
+
+Percentiles use linear interpolation, not nearest rank. The samples are sorted and the position of quantile `q` is `q * (n - 1)`. A position between two samples is a weighted blend of those two. With one sample, every stat is that sample. With two samples, p50 is the midpoint and p95 sits close to the slower one. The JSON report names this method `"linear"`.
+
+`--warmup N` calls the first N queries once before scoring. Those calls are not timed and their ids are not scored. The default is 0. If N is larger than the dataset, the run exits 2. Warmup is there to drop cold-start cost, such as the first import or the first connection.
+
+`--max-latency p95=250` fails the run when that stat is above 250 milliseconds. Repeat the flag for more than one stat. The names are `mean`, `p50`, `p95`, `p99`, and `max`. A stat equal to its limit passes. The table has the same threshold and status columns as `--fail-under`. A miss is `failed latency:` and the exit code is 1. Quality metrics are unchanged, and a latency miss does not change the `failed` list of metric names.
+
+```bash
+retrieval-gate run \
+  --dataset examples/cases.jsonl \
+  --retriever examples.retriever:retrieve \
+  --k 5 \
+  --fail-under recall=0.8 \
+  --fail-under mrr=0.6 \
+  --warmup 2 \
+  --max-latency p95=250
+```
+
+That prints:
+
+```
+dataset: examples/cases.jsonl
+retriever: examples.retriever:retrieve
+k: 5
+cases: 10
+
+metric     score   threshold  status
+---------  ------  ---------  ------
+hit_rate   1.0000  -          -
+recall     1.0000  0.8000     pass
+precision  0.2200  -          -
+mrr        1.0000  0.6000     pass
+ndcg       0.9964  -          -
+
+tags
+tag      cases  hit_rate  recall  precision  mrr     ndcg
+-------  -----  --------  ------  ---------  ------  ------
+api      2      1.0000    1.0000  0.3000     1.0000  0.9820
+billing  3      1.0000    1.0000  0.2667     1.0000  0.9880
+
+worst misses
+none
+
+latency (ms)
+warmup: 2
+stat  ms      threshold  status
+----  ------  ---------  ------
+mean  0.0214  -          -
+p50   0.0202  -          -
+p95   0.0263  250.0000   pass
+p99   0.0266  -          -
+max   0.0266  -          -
+```
+
+The millisecond numbers above are from one run of the example retriever. The next run will not match them. See the note on noise below.
+
+The JSON report adds a `latency` object and a `latency_ms` field on each case:
+
+```json
+{
+  "unit": "ms",
+  "method": "linear",
+  "warmup": 2,
+  "mean": 0.021412,
+  "p50": 0.020192,
+  "p95": 0.026307,
+  "p99": 0.026556,
+  "max": 0.026618,
+  "thresholds": {"p95": 250.0},
+  "failed": []
+}
+```
+
+`compare` prints baseline, current, and the delta (current minus baseline) when both reports have latency. `--max-latency-increase 20` fails when the chosen stat is more than 20 percent above the baseline. `--latency-stat` picks that stat and defaults to `p95`. An increase equal to the limit passes. A baseline of 0 fails the check when the current stat is above 0.
+
+A baseline written before latency existed prints `baseline report has no latency` and skips the check. It does not fail and it does not crash. The same note is printed when the current report has no latency. If neither report has latency and the flag is left off, compare is unchanged.
+
+```bash
+retrieval-gate compare baseline.json report.json --max-latency-increase 50
+```
+
+Two runs of the example, after warmup, appended this:
+
+```
+latency (ms)
+max latency increase: 50% on p95
+stat  baseline  current  delta    status
+----  --------  -------  -------  ------
+mean  0.0214    0.0222   +0.0008  -
+p50   0.0202    0.0216   +0.0014  -
+p95   0.0263    0.0267   +0.0004  pass
+p99   0.0266    0.0281   +0.0015  -
+max   0.0266    0.0284   +0.0018  -
+```
+
+`examples/baseline.json` has no latency object. Comparing a new report to it prints `baseline report has no latency` and still checks the quality metrics.
+
+In a config file the keys are `warmup` and `max_latency`. `max_latency` is a mapping of stat to limit, or a list of `stat=milliseconds` strings, same shape as `fail_under`:
+
+```yaml
+warmup: 2
+max_latency:
+  p95: 250
+  max: 500
+```
+
+Latency moves around. The same retriever on the same cases will not hit the same millisecond twice, and a CI runner is slower than a laptop. Use `--warmup` so the first calls do not set p95, and set the gate well above the number you usually see. A gate at the exact p95 from one run will flap.
+
 ## Compare and CI
 
 Save a JSON report from a known-good retriever and check later runs against it. `compare` prints the per-metric delta (current minus baseline) and exits 1 when any metric drops by more than `--max-drop` (default 0.02). A drop equal to the limit passes.
@@ -279,6 +390,8 @@ Save a JSON report from a known-good retriever and check later runs against it. 
 It also lists cases that got worse, matched by id. A case is listed when recall dropped, nDCG dropped, or a hit became a miss. The worst 10 are shown. `--show-cases N` changes that cap, and `--show-cases 0` hides the list. Each row has the case id, the query shortened to 60 characters, baseline and current recall and nDCG, and doc ids that are missed now but were not missed in the baseline. Cases found in only one report are printed as a count and their ids. That does not fail the command. `--fail-on-case-regression` exits 1 when any single case recall drops. It is off by default, so the exit code stays the aggregate check. The same section is in the text report, in `--format markdown`, and in the file from `--json`. A baseline written before per-case results existed prints a note instead of the list.
 
 When both reports have per-tag scores, compare also prints each tag's delta. A baseline written before tags existed prints a note and does not fail. `--fail-on-tag-regression` applies `--max-drop` to every tag metric and exits 1 on a drop. It is off by default, so a drop in one tag does not change the exit code. Tags found in only one report are listed and do not fail the command.
+
+When both reports include latency, compare also prints those stats and the delta. `--max-latency-increase` can fail the command when one stat grew by more than a percent limit. A baseline with no latency prints a note and skips that check. See Latency.
 
 On a small labeled set, a 0.02 drop in recall or nDCG is often just which queries are in the file. `--bootstrap N` resamples the cases shared by both reports. For hit rate, recall, precision, MRR, and nDCG it prints the mean of current minus baseline, a confidence interval, and a two-sided p-value for a mean change of zero. Omit the flag, or pass 0, and the check stays off. Use 2000 resamples when you want an interval. `--confidence` defaults to 0.95. `--seed` defaults to 0, so the same two files print the same interval on every run.
 
@@ -291,6 +404,7 @@ retrieval-gate compare baseline.json report.json --max-drop 0.02
 retrieval-gate compare baseline.json report.json --show-cases 10 --json compare.json
 retrieval-gate compare baseline.json report.json --fail-on-tag-regression
 retrieval-gate compare baseline.json report.json --bootstrap 2000 --fail-on-significant-drop
+retrieval-gate compare baseline.json report.json --max-latency-increase 20 --latency-stat p95
 ```
 
 A GitHub Actions job that regenerates the report and compares it:
@@ -331,7 +445,7 @@ retrieval-gate run \
 
 ## GitHub Actions
 
-`--format markdown` prints a table of metrics, thresholds, baseline deltas, and pass/fail. When cases have tags, it adds the per-tag table. Use it in a pull request comment or `$GITHUB_STEP_SUMMARY`. `--output` writes that same text to a file. `run` and `compare` both accept the two flags.
+`--format markdown` prints a table of metrics, thresholds, baseline deltas, and pass/fail. When cases have tags, it adds the per-tag table. When the run timed calls, it adds a latency table. Use it in a pull request comment or `$GITHUB_STEP_SUMMARY`. `--output` writes that same text to a file. `run` and `compare` both accept the two flags.
 
 ```bash
 retrieval-gate run \
@@ -366,4 +480,4 @@ jobs:
           baseline: examples/baseline.json
 ```
 
-`examples/gate.yml` holds the retriever, cutoff, and thresholds for the checked-in example. Paths in that file are relative to the file. The `dataset` and `baseline` inputs override it when you set them. In another repository, replace `./` with `sandeep-paluru/retrieval-gate@<ref>`. The step fails on a missed threshold or a baseline drop, after the summary is written.
+`examples/gate.yml` holds the retriever, cutoff, and thresholds for the checked-in example. Paths in that file are relative to the file. The `dataset` and `baseline` inputs override it when you set them. The action also takes `warmup` and `max-latency` (`p95=250`, space-separated if you set more than one stat). Both override the config file when set. In another repository, replace `./` with `sandeep-paluru/retrieval-gate@<ref>`. The step fails on a missed threshold, a latency gate, or a baseline drop, after the summary is written.
