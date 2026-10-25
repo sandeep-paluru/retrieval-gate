@@ -46,7 +46,7 @@ def test_run_report_and_threshold_failure(tmp_path):
     text = result.stdout or ""
     assert result.exit_code == 1, _output(result)
     assert fakes.calls == [("cats", 2), ("none", 2)]
-    assert text == (
+    assert text.startswith(
         f"dataset: {dataset}\n"
         "retriever: tests.fakes:retrieve\n"
         "k: 2\n"
@@ -67,6 +67,7 @@ def test_run_report_and_threshold_failure(tmp_path):
         "\n"
         "failed: recall\n"
     )
+    assert "\n\nlatency (ms)\n" in text
     report = json.loads(json_path.read_text(encoding="utf-8"))
     assert report["failed"] == ["recall"]
     assert report["metrics"]["recall"] == 0.5
@@ -132,7 +133,7 @@ def test_run_markdown_format_and_output(tmp_path):
     )
     text = result.stdout or ""
     assert result.exit_code == 1, _output(result)
-    assert text == (
+    assert text.startswith(
         "## retrieval-gate\n"
         "\n"
         f"dataset: {dataset}\n"
@@ -150,6 +151,7 @@ def test_run_markdown_format_and_output(tmp_path):
         "\n"
         "failed: recall\n"
     )
+    assert "\n\n### latency\n" in text
     assert output.read_text(encoding="utf-8") == text
     assert "worst misses" not in text
 

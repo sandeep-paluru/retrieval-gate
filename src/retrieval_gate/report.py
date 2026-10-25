@@ -6,7 +6,9 @@ import math
 from collections.abc import Callable
 from pathlib import Path
 
+import retrieval_gate.latency as gate_latency
 from retrieval_gate.errors import ConfigError, DatasetError
+from retrieval_gate.latency import LATENCY_STATS
 from retrieval_gate.metrics import METRIC_NAMES, score_at_cutoffs, top_unique
 from retrieval_gate.models import Case
 from retrieval_gate.retriever import call_retriever
@@ -28,6 +30,8 @@ def build_report(
     concurrency: int = 1,
     k_values: list[int] | None = None,
     thresholds_by_k: dict[int, dict[str, float]] | None = None,
+    warmup: int = 0,
+    latency_thresholds: dict[str, float] | None = None,
 ) -> dict:
     """Score every case and average the metrics.
 
@@ -51,6 +55,15 @@ def build_report(
 
     Calls run one at a time when ``concurrency`` is 1. A larger value
     keeps that many calls in flight. Import-path runs leave it at 1.
+
+    Each scored call is timed with ``time.perf_counter`` and stored as
+    ``latency_ms`` on that case. The ``latency`` object is the mean, p50,
+    p95, p99, and max of those samples, in milliseconds. Percentiles use
+    linear interpolation. ``warmup`` runs that many leading queries once
+    first. Those calls are not timed and their ids are not scored.
+    ``latency_thresholds`` maps a stat to a millisecond limit. A stat
+    strictly above its limit is listed in ``latency.failed``. Time spent
+    waiting for a free concurrency slot is not included.
     """
 
     cutoffs = _checked_cutoffs(k, k_values)
@@ -62,10 +75,14 @@ def build_report(
         tag_thresholds = {}
     limits_by_k = _limits_by_cutoff(cutoffs, thresholds, thresholds_by_k)
     _require_tagged_cases(cases, tag_thresholds)
-    retrieved_lists = asyncio.run(_retrieve_all(retriever, cases, retrieve_k, concurrency))
+    warmup_n = _checked_warmup(warmup, len(cases))
+    latency_limits = _checked_latency_thresholds(latency_thresholds)
+    retrieved_lists, samples = asyncio.run(
+        _score_cases(retriever, cases, retrieve_k, concurrency, warmup_n)
+    )
     results = []
     raw_by_k: dict[int, list[dict[str, float]]] = {cutoff: [] for cutoff in cutoffs}
-    for case, retrieved in zip(cases, retrieved_lists, strict=True):
+    for index, (case, retrieved) in enumerate(zip(cases, retrieved_lists, strict=True)):
         try:
             scored = score_at_cutoffs(retrieved, case.relevant, cutoffs)
         except ValueError as exc:
@@ -89,6 +106,7 @@ def build_report(
                 "relevant": dict(case.relevant),
                 "misses": misses,
                 "metrics": {name: round(largest[name], 6) for name in METRIC_NAMES},
+                "latency_ms": samples[index],
             }
         )
     metrics = _mean_metrics(raw_by_k[retrieve_k])
@@ -126,6 +144,17 @@ def build_report(
     if multi:
         report["k_values"] = list(cutoffs)
         report["cutoffs"] = cutoff_rows
+    latency_stats = gate_latency.summarize(samples)
+    report["latency"] = {
+        "unit": "ms",
+        "method": gate_latency.PERCENTILE_METHOD,
+        "warmup": warmup_n,
+        **latency_stats,
+        "thresholds": {
+            name: latency_limits[name] for name in LATENCY_STATS if name in latency_limits
+        },
+        "failed": gate_latency.exceeded(latency_stats, latency_limits),
+    }
     report["results"] = results
     if tag_rows:
         report["tags"] = tag_rows
@@ -252,32 +281,107 @@ def _require_tagged_cases(cases: list[Case], thresholds: dict[str, dict[str, flo
     raise ConfigError(f"no cases tagged {names}")
 
 
+def _checked_warmup(warmup: int, case_count: int) -> int:
+    if isinstance(warmup, bool) or not isinstance(warmup, int) or warmup < 0:
+        raise ConfigError("warmup must be an integer >= 0")
+    if warmup > case_count:
+        raise ConfigError(f"warmup {warmup} is larger than the dataset ({case_count} cases)")
+    return warmup
+
+
+def _checked_latency_thresholds(thresholds: dict[str, float] | None) -> dict[str, float]:
+    if not thresholds:
+        return {}
+    cleaned: dict[str, float] = {}
+    for name, limit in thresholds.items():
+        if name not in LATENCY_STATS:
+            names = ", ".join(LATENCY_STATS)
+            raise ConfigError(f"unknown latency stat {name!r} (expected {names})")
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, (int, float))
+            or not math.isfinite(float(limit))
+            or float(limit) < 0
+        ):
+            raise ConfigError(f"max_latency {name} must be a number >= 0")
+        cleaned[name] = float(limit)
+    return cleaned
+
+
+async def _score_cases(
+    retriever: Callable,
+    cases: list[Case],
+    k: int,
+    concurrency: int,
+    warmup: int,
+) -> tuple[list[list[str]], list[float]]:
+    """Warm up the leading queries, then time one call per case."""
+
+    if warmup:
+        await _retrieve_all(retriever, cases[:warmup], k, concurrency, timed=False)
+    return await _retrieve_all(retriever, cases, k, concurrency, timed=True)
+
+
 async def _retrieve_all(
     retriever: Callable,
     cases: list[Case],
     k: int,
     concurrency: int,
-) -> list[list[str]]:
+    *,
+    timed: bool,
+) -> tuple[list[list[str]], list[float]]:
+    """Call the retriever once per case.
+
+    A concurrency of 1 stops at the first error and does not call the
+    rest. A larger limit keeps that many calls in flight and still
+    reports the earliest error in case order. The timer starts after a
+    concurrency slot is acquired, so one slow call does not inflate the
+    next call's latency.
+    """
+
     if concurrency <= 1:
         lists = []
+        samples = []
         for case in cases:
-            lists.append(await call_retriever(retriever, case.query, k, case.id))
-        return lists
+            ids, elapsed = await _one_call(retriever, case, k, timed=timed)
+            lists.append(ids)
+            samples.append(elapsed)
+        return lists, samples
 
     semaphore = asyncio.Semaphore(concurrency)
 
-    async def one(case: Case) -> list[str] | ConfigError:
+    async def one(case: Case) -> tuple[list[str], float] | ConfigError:
         async with semaphore:
             try:
-                return await call_retriever(retriever, case.query, k, case.id)
+                return await _one_call(retriever, case, k, timed=timed)
             except ConfigError as exc:
                 return exc
 
     retrieved = await asyncio.gather(*(one(case) for case in cases))
+    lists = []
+    samples = []
     for item in retrieved:
         if isinstance(item, ConfigError):
             raise item
-    return retrieved
+        ids, elapsed = item
+        lists.append(ids)
+        samples.append(elapsed)
+    return lists, samples
+
+
+async def _one_call(
+    retriever: Callable,
+    case: Case,
+    k: int,
+    *,
+    timed: bool,
+) -> tuple[list[str], float]:
+    if not timed:
+        ids = await call_retriever(retriever, case.query, k, case.id)
+        return ids, 0.0
+    start = gate_latency.clock()
+    ids = await call_retriever(retriever, case.query, k, case.id)
+    return ids, gate_latency.elapsed_ms(start, gate_latency.clock())
 
 
 def format_report(report: dict) -> str:
@@ -315,7 +419,7 @@ def format_report(report: dict) -> str:
     failed_tags = _failed_tag_text(report)
     if failed_tags:
         lines.extend(["", failed_tags])
-    return "\n".join(lines)
+    return _with_latency_section("\n".join(lines), report)
 
 
 def _format_cutoff_report(report: dict, cutoffs: list[dict]) -> str:
@@ -361,7 +465,7 @@ def _format_cutoff_report(report: dict, cutoffs: list[dict]) -> str:
     failed_tags = _failed_tag_text(report)
     if failed_tags:
         lines.extend(["", failed_tags])
-    return "\n".join(lines)
+    return _with_latency_section("\n".join(lines), report)
 
 
 def _threshold_table_rows(cutoffs: list[dict]) -> list[list[str]]:
@@ -441,6 +545,252 @@ def render_table(headers: list[str], rows: list[list[str]]) -> str:
     ]
     lines.extend(format_row(row) for row in rows)
     return "\n".join(lines)
+
+
+def format_latency(report: dict) -> str:
+    """Plain text latency table, or empty when the report has no latency."""
+
+    parsed = gate_latency.read_block(report)
+    if parsed is None:
+        return ""
+    thresholds = parsed["thresholds"]
+    failed = set(parsed["failed"])
+    rows = []
+    for name in LATENCY_STATS:
+        limit = thresholds.get(name)
+        if limit is None:
+            status = "-"
+            limit_text = "-"
+        else:
+            status = "FAIL" if name in failed else "pass"
+            limit_text = f"{limit:.4f}"
+        rows.append([name, f"{parsed['stats'][name]:.4f}", limit_text, status])
+    lines = ["latency (ms)"]
+    if parsed["warmup"]:
+        lines.append(f"warmup: {parsed['warmup']}")
+    lines.append(render_table(["stat", "ms", "threshold", "status"], rows))
+    failed_text = _failed_latency_text(parsed["failed"])
+    if failed_text:
+        lines.extend(["", failed_text])
+    return "\n".join(lines)
+
+
+def _failed_latency_text(failed: list[str]) -> str:
+    if not failed:
+        return ""
+    return "failed latency: " + ", ".join(failed)
+
+
+def _with_latency_section(text: str, report: dict) -> str:
+    block = format_latency(report)
+    if not block:
+        return text
+    return f"{text}\n\n{block}"
+
+
+def _with_latency_comparison(
+    text: str,
+    baseline: dict,
+    current: dict,
+    stat: str,
+    max_increase: float | None,
+) -> str:
+    block = _format_latency_comparison(
+        gate_latency.comparison(baseline, current, stat=stat, max_increase=max_increase),
+        markdown=False,
+    )
+    if not block:
+        return text
+    return f"{text}\n\n{block}"
+
+
+def _with_latency_markdown(
+    text: str,
+    report: dict,
+    baseline: dict | None,
+    *,
+    check_thresholds: bool,
+    latency_stat: str,
+    max_latency_increase: float | None,
+) -> str:
+    """Append latency to a markdown report.
+
+    A run with a baseline that also recorded latency uses one table,
+    the same way the metric table carries the baseline and the delta.
+    compare prints only the delta table. A missing side is a note.
+    """
+
+    view = None
+    if baseline is not None:
+        view = gate_latency.comparison(
+            baseline,
+            report,
+            stat=latency_stat,
+            max_increase=max_latency_increase,
+        )
+    current = gate_latency.read_block(report) if check_thresholds else None
+    if current is not None and view is not None and view["available"]:
+        block = _markdown_latency_with_baseline(current, view)
+    elif current is not None:
+        block = _markdown_latency_gate(report)
+        if view is not None and view["show"] and not view["available"]:
+            block = f"{block}\n\n{view['message']}"
+    elif view is not None:
+        block = _format_latency_comparison(view, markdown=True)
+    else:
+        block = ""
+    if not block:
+        return text
+    return f"{text}\n\n{block}"
+
+
+def _markdown_latency_with_baseline(parsed: dict, view: dict) -> str:
+    thresholds = parsed["thresholds"]
+    failed = set(parsed["failed"])
+    rows = []
+    for name in LATENCY_STATS:
+        limit = thresholds.get(name)
+        if limit is None:
+            status = "-"
+            limit_text = "-"
+        else:
+            status = "FAIL" if name in failed else "pass"
+            limit_text = f"{limit:.4f}"
+        rows.append(
+            [
+                name,
+                f"{parsed['stats'][name]:.4f}",
+                limit_text,
+                f"{view['baseline'][name]:.4f}",
+                f"{view['delta'][name]:+.4f}",
+                status,
+            ]
+        )
+    lines = ["### latency", ""]
+    if parsed["warmup"]:
+        lines.append(f"warmup: {parsed['warmup']}")
+        lines.append("")
+    lines.append(
+        _markdown_grid(
+            ["stat", "ms", "threshold", "baseline", "delta", "status"],
+            rows,
+            numeric_from=1,
+            status_at=5,
+        )
+    )
+    failed_text = _failed_latency_text(parsed["failed"])
+    if failed_text:
+        lines.extend(["", failed_text])
+    return "\n".join(lines)
+
+
+def _markdown_latency_gate(report: dict) -> str:
+    parsed = gate_latency.read_block(report)
+    if parsed is None:
+        return ""
+    thresholds = parsed["thresholds"]
+    failed = set(parsed["failed"])
+    rows = []
+    for name in LATENCY_STATS:
+        limit = thresholds.get(name)
+        if limit is None:
+            status = "-"
+            limit_text = "-"
+        else:
+            status = "FAIL" if name in failed else "pass"
+            limit_text = f"{limit:.4f}"
+        rows.append([name, f"{parsed['stats'][name]:.4f}", limit_text, status])
+    lines = ["### latency", ""]
+    if parsed["warmup"]:
+        lines.append(f"warmup: {parsed['warmup']}")
+        lines.append("")
+    lines.append(
+        _markdown_grid(
+            ["stat", "ms", "threshold", "status"],
+            rows,
+            numeric_from=1,
+            status_at=3,
+        )
+    )
+    failed_text = _failed_latency_text(parsed["failed"])
+    if failed_text:
+        lines.extend(["", failed_text])
+    return "\n".join(lines)
+
+
+def _format_latency_comparison(view: dict, *, markdown: bool) -> str:
+    if not view["show"]:
+        return ""
+    lines = ["### latency", ""] if markdown else ["latency (ms)"]
+    if not view["available"]:
+        lines.append(view["message"])
+        return "\n".join(lines)
+    if view["checked"]:
+        lines.append(
+            "max latency increase: "
+            f"{_format_percent(view['max_increase'])}% on {view['stat']}"
+        )
+    headers = ["stat", "baseline", "current", "delta"]
+    if view["checked"]:
+        headers.append("status")
+    rows = []
+    for name in LATENCY_STATS:
+        row = [
+            name,
+            f"{view['baseline'][name]:.4f}",
+            f"{view['current'][name]:.4f}",
+            f"{view['delta'][name]:+.4f}",
+        ]
+        if view["checked"]:
+            row.append(_latency_compare_status(view, name))
+        rows.append(row)
+    if markdown:
+        lines.append(
+            _markdown_grid(
+                headers,
+                rows,
+                numeric_from=1,
+                status_at=4 if view["checked"] else None,
+            )
+        )
+    else:
+        lines.append(render_table(headers, rows))
+    failed_text = _failed_latency_text(view["failed"])
+    if failed_text:
+        lines.extend(["", failed_text])
+    return "\n".join(lines)
+
+
+def _latency_compare_status(view: dict, name: str) -> str:
+    if name != view["stat"]:
+        return "-"
+    return "FAIL" if view["failed"] else "pass"
+
+
+def _format_percent(value: float) -> str:
+    text = f"{value:.4f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _public_latency_comparison(view: dict) -> dict | None:
+    if not view["show"]:
+        return None
+    payload: dict = {
+        "available": view["available"],
+        "stat": view["stat"],
+        "max_increase": view["max_increase"],
+        "checked": view["checked"],
+    }
+    if view["message"]:
+        payload["message"] = view["message"]
+    if not view["available"]:
+        return payload
+    payload["baseline"] = dict(view["baseline"])
+    payload["current"] = dict(view["current"])
+    payload["delta"] = dict(view["delta"])
+    payload["failed"] = list(view["failed"])
+    payload["status"] = "FAIL" if view["failed"] else ("pass" if view["checked"] else "-")
+    return payload
 
 
 def write_report(path: Path, report: dict) -> None:
@@ -604,6 +954,8 @@ def format_comparison(
     max_drop: float,
     *,
     check_tags: bool = False,
+    latency_stat: str = "p95",
+    max_latency_increase: float | None = None,
 ) -> tuple[str, list[str]]:
     """Return the comparison table and the metrics that regressed.
 
@@ -628,6 +980,8 @@ def format_comparison(
             max_drop,
             plan,
             check_tags=check_tags,
+            latency_stat=latency_stat,
+            max_latency_increase=max_latency_increase,
         )
     failed = regressed_metrics(baseline, current, max_drop)
     failed_set = set(failed)
@@ -655,7 +1009,14 @@ def format_comparison(
     )
     if tag_text:
         lines.extend(["", tag_text])
-    return "\n".join(lines), failed
+    text = _with_latency_comparison(
+        "\n".join(lines),
+        baseline,
+        current,
+        latency_stat,
+        max_latency_increase,
+    )
+    return text, failed
 
 
 def _k_text(report: dict) -> str:
@@ -674,6 +1035,8 @@ def _format_cutoff_comparison(
     plan: dict,
     *,
     check_tags: bool,
+    latency_stat: str = "p95",
+    max_latency_increase: float | None = None,
 ) -> tuple[str, list[str]]:
     failed = regressed_metrics(baseline, current, max_drop)
     lines = [
@@ -708,7 +1071,14 @@ def _format_cutoff_comparison(
     )
     if tag_text:
         lines.extend(["", tag_text])
-    return "\n".join(lines), failed
+    text = _with_latency_comparison(
+        "\n".join(lines),
+        baseline,
+        current,
+        latency_stat,
+        max_latency_increase,
+    )
+    return text, failed
 
 
 def _cutoff_plan(baseline: dict, current: dict) -> dict:
@@ -834,6 +1204,8 @@ def format_markdown(
     current_path: str | None = None,
     check_thresholds: bool = True,
     check_tags: bool = False,
+    latency_stat: str = "p95",
+    max_latency_increase: float | None = None,
 ) -> str:
     """Return a compact Markdown table for a pull request or job summary.
 
@@ -853,6 +1225,10 @@ def format_markdown(
     side has cutoffs, the delta is at the single report's k when that
     cutoff was scored. Otherwise the report says the metrics were not
     compared.
+
+    When the report has latency, a millisecond table is added after the
+    quality section. A baseline that also has latency adds the delta.
+    A baseline without latency prints a note and is not a failure.
     """
 
     if _stored_cutoffs(report) is not None or (
@@ -866,6 +1242,8 @@ def format_markdown(
             current_path=current_path,
             check_thresholds=check_thresholds,
             check_tags=check_tags,
+            latency_stat=latency_stat,
+            max_latency_increase=max_latency_increase,
         )
 
     thresholds = report.get("thresholds") or {}
@@ -920,7 +1298,14 @@ def format_markdown(
     )
     if tag_text:
         lines.extend(["", tag_text])
-    return "\n".join(lines)
+    return _with_latency_markdown(
+        "\n".join(lines),
+        report,
+        baseline,
+        check_thresholds=check_thresholds,
+        latency_stat=latency_stat,
+        max_latency_increase=max_latency_increase,
+    )
 
 
 def _format_markdown_cutoffs(
@@ -932,6 +1317,8 @@ def _format_markdown_cutoffs(
     current_path: str | None,
     check_thresholds: bool,
     check_tags: bool,
+    latency_stat: str = "p95",
+    max_latency_increase: float | None = None,
 ) -> str:
     plan = _cutoff_plan(baseline, report) if baseline is not None else None
     lines = ["## retrieval-gate"]
@@ -988,7 +1375,14 @@ def _format_markdown_cutoffs(
     )
     if tag_text:
         lines.extend(["", tag_text])
-    return "\n".join(lines)
+    return _with_latency_markdown(
+        "\n".join(lines),
+        report,
+        baseline,
+        check_thresholds=check_thresholds,
+        latency_stat=latency_stat,
+        max_latency_increase=max_latency_increase,
+    )
 
 
 def _markdown_score_table(cutoffs: list[dict]) -> str:
@@ -1240,6 +1634,8 @@ def comparison_payload(
     *,
     check_tags: bool = False,
     bootstrap: dict | None = None,
+    latency_stat: str = "p95",
+    max_latency_increase: float | None = None,
 ) -> dict:
     """JSON body for ``compare --json``.
 
@@ -1252,6 +1648,10 @@ def comparison_payload(
 
     ``bootstrap`` is included only when a resample was requested.
     ``bootstrap.checked`` is true when a significant drop can fail the command.
+
+    ``latency`` is included when either report has latency stats, or when
+    an increase check was requested. A baseline without latency sets
+    ``available`` false and does not fail the check.
     """
 
     failed = regressed_metrics(baseline, current, max_drop)
@@ -1302,6 +1702,16 @@ def comparison_payload(
         payload["message"] = plan["message"]
     if bootstrap is not None:
         payload["bootstrap"] = bootstrap
+    latency = _public_latency_comparison(
+        gate_latency.comparison(
+            baseline,
+            current,
+            stat=latency_stat,
+            max_increase=max_latency_increase,
+        )
+    )
+    if latency is not None:
+        payload["latency"] = latency
     return payload
 
 

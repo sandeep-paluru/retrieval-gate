@@ -26,6 +26,8 @@ from retrieval_gate.http_retriever import (
     normalize_method,
     public_url,
 )
+from retrieval_gate.latency import LATENCY_STATS
+from retrieval_gate.latency import comparison as latency_comparison
 from retrieval_gate.metrics import METRIC_NAMES
 from retrieval_gate.report import (
     build_report,
@@ -68,6 +70,8 @@ _CONFIG_KEYS = {
     "fail_under_tag",
     "baseline",
     "max_drop",
+    "warmup",
+    "max_latency",
 }
 
 _HTTP_FLAGS = {
@@ -196,9 +200,9 @@ def run(
         "--config",
         help=(
             "YAML file with dataset, retriever or retriever_url, k or k_values, "
-            "fail_under, fail_under_tag, baseline, and max_drop. Import-path runs also read "
-            "adapter and id_field. HTTP runs also read method, headers, timeout, "
-            "concurrency, results_key, and id_field."
+            "fail_under, fail_under_tag, baseline, max_drop, warmup, and max_latency. "
+            "Import-path runs also read adapter and id_field. HTTP runs also read "
+            "method, headers, timeout, concurrency, results_key, and id_field."
         ),
     ),
     baseline: Path | None = typer.Option(
@@ -210,6 +214,23 @@ def run(
         None,
         "--max-drop",
         help="Maximum allowed drop versus the baseline. Defaults to 0.02.",
+    ),
+    warmup: int | None = typer.Option(
+        None,
+        "--warmup",
+        help=(
+            "Run the first N queries once before scoring. Those calls are "
+            "not timed and not scored. Defaults to 0."
+        ),
+    ),
+    max_latency: list[str] | None = typer.Option(
+        None,
+        "--max-latency",
+        help=(
+            "Gate a latency stat in milliseconds, as stat=value. "
+            "Stats are mean, p50, p95, p99, and max. A value above the "
+            "limit fails. Repeat for more than one stat."
+        ),
     ),
 ) -> None:
     """Score a retriever on a labeled dataset."""
@@ -226,6 +247,10 @@ def run(
         )
         chosen_baseline = baseline if baseline is not None else cfg["baseline"]
         chosen_drop = _choose_max_drop(max_drop, cfg["max_drop"], chosen_baseline)
+        chosen_warmup = _choose_warmup(warmup, cfg["warmup"])
+        latency_limits = (
+            parse_max_latency(max_latency) if max_latency else cfg["latency_thresholds"]
+        )
         if chosen_dataset is None:
             raise ConfigError("pass --dataset or set dataset in --config")
         chosen_k = cutoffs[-1]
@@ -254,6 +279,8 @@ def run(
             concurrency=request_concurrency,
             k_values=cutoffs if multi else None,
             thresholds_by_k=bound_thresholds if multi else None,
+            warmup=chosen_warmup,
+            latency_thresholds=latency_limits,
         )
         baseline_report = (
             load_report(chosen_baseline) if chosen_baseline is not None else None
@@ -276,7 +303,8 @@ def run(
         if baseline_report is not None
         else []
     )
-    if report["failed"] or report.get("failed_tags") or dropped:
+    latency_failed = bool((report.get("latency") or {}).get("failed"))
+    if report["failed"] or report.get("failed_tags") or dropped or latency_failed:
         raise typer.Exit(code=1)
 
 
@@ -342,6 +370,24 @@ def compare(
             "Off by default. Applies only when --bootstrap is set."
         ),
     ),
+    max_latency_increase: float | None = typer.Option(
+        None,
+        "--max-latency-increase",
+        help=(
+            "Fail when the chosen latency stat is more than this percent "
+            "above the baseline. For example 20 allows up to a 20 percent "
+            "increase. An equal increase passes. Skipped when the baseline "
+            "has no latency."
+        ),
+    ),
+    latency_stat: str = typer.Option(
+        "p95",
+        "--latency-stat",
+        help=(
+            "Which latency stat --max-latency-increase checks. "
+            "One of mean, p50, p95, p99, max. Default p95."
+        ),
+    ),
 ) -> None:
     """Compare two JSON reports and fail on a regression.
 
@@ -357,6 +403,12 @@ def compare(
         _checked_bootstrap(bootstrap_samples)
         _checked_confidence(confidence)
         _checked_seed(seed)
+        chosen_stat = _checked_latency_stat(latency_stat)
+        chosen_increase = (
+            None
+            if max_latency_increase is None
+            else _checked_latency_increase(max_latency_increase)
+        )
         before = load_report(baseline)
         after = load_report(current)
         diff = case_diff(before, after)
@@ -381,6 +433,8 @@ def compare(
                 current_path=str(current),
                 check_thresholds=False,
                 check_tags=fail_on_tag_regression,
+                latency_stat=chosen_stat,
+                max_latency_increase=chosen_increase,
             )
             failed = regressed_metrics(before, after, max_drop)
             section = format_case_diff_markdown(diff, show_cases)
@@ -392,6 +446,8 @@ def compare(
                 after,
                 max_drop,
                 check_tags=fail_on_tag_regression,
+                latency_stat=chosen_stat,
+                max_latency_increase=chosen_increase,
             )
             section = format_case_diff(diff, show_cases)
         recall_ids = [row["id"] for row in diff["worse"] if row["recall_dropped"]]
@@ -419,8 +475,18 @@ def compare(
                     show_cases,
                     check_tags=fail_on_tag_regression,
                     bootstrap=bootstrap,
+                    latency_stat=chosen_stat,
+                    max_latency_increase=chosen_increase,
                 ),
             )
+        latency_failed = bool(
+            latency_comparison(
+                before,
+                after,
+                stat=chosen_stat,
+                max_increase=chosen_increase,
+            )["failed"]
+        )
     except (DatasetError, ConfigError) as exc:
         _fail(str(exc))
     bootstrap_failed = bool(
@@ -429,7 +495,7 @@ def compare(
         and bootstrap["available"]
         and bootstrap["significant"]
     )
-    if failed or case_failed or tag_failed or bootstrap_failed:
+    if failed or case_failed or tag_failed or bootstrap_failed or latency_failed:
         raise typer.Exit(code=1)
 
 
@@ -560,6 +626,40 @@ def parse_fail_under_tag(items: list[str]) -> dict[str, dict[str, float]]:
     return thresholds
 
 
+def parse_max_latency(items: list[str], *, label: str = "--max-latency") -> dict[str, float]:
+    """Parse repeated ``stat=milliseconds`` latency gates.
+
+    Stats are mean, p50, p95, p99, and max. The value is a limit in
+    milliseconds, zero or greater. A stat above the limit fails. A stat
+    equal to the limit passes.
+    """
+
+    allowed = set(LATENCY_STATS)
+    thresholds: dict[str, float] = {}
+    for item in items:
+        if "=" not in item:
+            raise ConfigError(f"{label} {item!r} must look like stat=milliseconds")
+        name, raw = item.split("=", 1)
+        name = name.strip()
+        if name not in allowed:
+            names = ", ".join(LATENCY_STATS)
+            raise ConfigError(f"unknown latency stat {name!r} in {label} (expected {names})")
+        if name in thresholds:
+            raise ConfigError(f"{label} stat {name!r} was given twice")
+        thresholds[name] = _latency_limit(label, item, name, raw)
+    return thresholds
+
+
+def _latency_limit(flag: str, item: str, name: str, raw: str) -> float:
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ConfigError(f"{flag} {item!r} value is not a number") from exc
+    if not math.isfinite(value) or value < 0:
+        raise ConfigError(f"{flag} {name} must be a number >= 0")
+    return value
+
+
 def _threshold_value(flag: str, item: str, name: str, raw: str) -> float:
     try:
         value = float(raw)
@@ -688,11 +788,14 @@ def load_config(path: Path) -> dict:
     of ``tag:metric=value`` strings. A ``fail_under`` metric may be
     ``recall`` or ``recall@5``. ``k_values`` is a list of cutoffs or the
     same comma-separated text as ``--k-values``. Set ``k`` or ``k_values``,
-    not both. ``retriever_url`` calls an HTTP
+    not both.     ``retriever_url`` calls an HTTP
     service. ``method``, ``headers``, ``timeout``, ``concurrency``,
     and ``results_key`` apply to that service. ``id_field`` applies to
     the service and to a LangChain or LlamaIndex retriever. ``adapter``
-    is auto, langchain, or llamaindex.
+    is auto, langchain, or llamaindex. ``warmup`` is how many leading
+    queries to call once before scoring. ``max_latency`` is a mapping of
+    stat to a millisecond limit, or a list of ``stat=milliseconds``
+    strings. Stats are mean, p50, p95, p99, and max.
     """
 
     if not path.is_file():
@@ -728,6 +831,8 @@ def load_config(path: Path) -> dict:
         "max_drop": _config_max_drop(path, raw.get("max_drop")),
         "thresholds": _config_thresholds(path, raw.get("fail_under")),
         "tag_thresholds": _config_tag_thresholds(path, raw.get("fail_under_tag")),
+        "warmup": _config_warmup(path, raw.get("warmup")),
+        "latency_thresholds": _config_max_latency(path, raw.get("max_latency")),
     }
 
 
@@ -749,6 +854,8 @@ def _empty_config() -> dict:
         "max_drop": None,
         "thresholds": {},
         "tag_thresholds": {},
+        "warmup": None,
+        "latency_thresholds": {},
     }
 
 
@@ -782,6 +889,14 @@ def _choose_cutoffs(
             raise ConfigError("k must be >= 1")
         return [configured_k]
     return [5]
+
+
+def _choose_warmup(flag: int | None, configured: int | None) -> int:
+    if flag is not None:
+        return _checked_warmup(flag)
+    if configured is not None:
+        return configured
+    return 0
 
 
 def _choose_max_drop(
@@ -905,6 +1020,37 @@ def _config_k_values(path: Path, value: object) -> list[int] | None:
         raise ConfigError(f"{path}: {exc}") from exc
 
 
+def _config_warmup(path: Path, value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ConfigError(f"{path}: warmup must be an integer >= 0")
+    return value
+
+
+def _config_max_latency(path: Path, value: object) -> dict[str, float]:
+    if value is None:
+        return {}
+    try:
+        if isinstance(value, dict):
+            items = []
+            for name, limit in value.items():
+                if isinstance(limit, bool) or not isinstance(limit, (int, float)):
+                    raise ConfigError(f"max_latency.{name} must be a number")
+                items.append(f"{name}={limit}")
+            return parse_max_latency(items, label="max_latency")
+        if isinstance(value, list):
+            items = []
+            for item in value:
+                if not isinstance(item, str):
+                    raise ConfigError("max_latency entries must be stat=milliseconds strings")
+                items.append(item)
+            return parse_max_latency(items, label="max_latency")
+    except ConfigError as exc:
+        raise ConfigError(f"{path}: {exc}") from exc
+    raise ConfigError(f"{path}: max_latency must be a mapping or a list")
+
+
 def _config_max_drop(path: Path, value: object) -> float | None:
     if value is None:
         return None
@@ -1002,6 +1148,28 @@ def _checked_seed(value: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ConfigError("--seed must be an integer")
     return value
+
+
+def _checked_warmup(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ConfigError("--warmup must be an integer >= 0")
+    return value
+
+
+def _checked_latency_stat(value: str) -> str:
+    name = value.strip().lower()
+    if name not in LATENCY_STATS:
+        names = ", ".join(LATENCY_STATS)
+        raise ConfigError(f"--latency-stat must be one of {names}")
+    return name
+
+
+def _checked_latency_increase(value: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ConfigError("--max-latency-increase must be a number >= 0")
+    if value < 0:
+        raise ConfigError("--max-latency-increase must be a number >= 0")
+    return float(value)
 
 
 def _render_run(

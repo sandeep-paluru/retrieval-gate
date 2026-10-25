@@ -8,8 +8,8 @@ inputs:
     description: >
       Path to a YAML config. Keys are dataset, retriever, retriever_url,
       adapter, method, headers, timeout, concurrency, results_key, id_field, k,
-      k_values, fail_under, fail_under_tag, baseline, and max_drop. Paths inside
-      the file are relative to the file.
+      k_values, fail_under, fail_under_tag, baseline, max_drop, warmup, and
+      max_latency. Paths inside the file are relative to the file.
     required: false
     default: ""
   dataset:
@@ -49,6 +49,19 @@ inputs:
       An equal drop passes. Overrides config. Defaults to 0.02.
     required: false
     default: ""
+  warmup:
+    description: >
+      Run the first N queries once before scoring. Those calls are not
+      timed and not scored. Overrides config. Defaults to 0.
+    required: false
+    default: ""
+  max-latency:
+    description: >
+      Space-separated latency gates in milliseconds, for example
+      "p95=250 max=500". Stats are mean, p50, p95, p99, and max.
+      A stat above the limit fails the step. Overrides config when set.
+    required: false
+    default: ""
   python-version:
     description: Python version used to install and run retrieval-gate.
     required: false
@@ -84,6 +97,8 @@ runs:
         RG_K_VALUES: ${{ inputs.k-values }}
         RG_FAIL_UNDER: ${{ inputs.fail-under }}
         RG_MAX_DROP: ${{ inputs.max-drop }}
+        RG_WARMUP: ${{ inputs.warmup }}
+        RG_MAX_LATENCY: ${{ inputs.max-latency }}
       run: |
         set -euo pipefail
         report="${RUNNER_TEMP:-/tmp}/retrieval-gate.md"
@@ -113,6 +128,15 @@ runs:
           read -r -a limits <<< "$RG_FAIL_UNDER"
           for item in "${limits[@]}"; do
             cmd+=(--fail-under "$item")
+          done
+        fi
+        if [[ -n "$RG_WARMUP" ]]; then
+          cmd+=(--warmup "$RG_WARMUP")
+        fi
+        if [[ -n "$RG_MAX_LATENCY" ]]; then
+          read -r -a latency_limits <<< "$RG_MAX_LATENCY"
+          for item in "${latency_limits[@]}"; do
+            cmd+=(--max-latency "$item")
           done
         fi
         set +e
