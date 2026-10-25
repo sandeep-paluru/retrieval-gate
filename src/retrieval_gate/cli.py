@@ -1,6 +1,7 @@
 """Command line interface for retrieval-gate."""
 
 import math
+import re
 from pathlib import Path
 
 import typer
@@ -62,6 +63,7 @@ _CONFIG_KEYS = {
     "id_field",
     "adapter",
     "k",
+    "k_values",
     "fail_under",
     "fail_under_tag",
     "baseline",
@@ -153,10 +155,21 @@ def run(
         "--k",
         help="Number of unique results to score per query. Defaults to 5.",
     ),
+    k_values: str | None = typer.Option(
+        None,
+        "--k-values",
+        help=(
+            "Comma-separated cutoffs, like 1,3,5,10. The retriever is called "
+            "once at the largest. Do not combine with --k."
+        ),
+    ),
     fail_under: list[str] | None = typer.Option(
         None,
         "--fail-under",
-        help="Gate a metric, as name=value. Repeat for more than one metric.",
+        help=(
+            "Gate a metric, as name=value or name@k=value. A bare name applies "
+            "to the largest cutoff. Repeat for more than one metric."
+        ),
     ),
     fail_under_tag: list[str] | None = typer.Option(
         None,
@@ -182,8 +195,8 @@ def run(
         None,
         "--config",
         help=(
-            "YAML file with dataset, retriever or retriever_url, k, fail_under, "
-            "fail_under_tag, baseline, and max_drop. Import-path runs also read "
+            "YAML file with dataset, retriever or retriever_url, k or k_values, "
+            "fail_under, fail_under_tag, baseline, and max_drop. Import-path runs also read "
             "adapter and id_field. HTTP runs also read method, headers, timeout, "
             "concurrency, results_key, and id_field."
         ),
@@ -205,8 +218,9 @@ def run(
         fmt = _checked_format(report_format)
         cfg = load_config(config) if config is not None else _empty_config()
         chosen_dataset = dataset if dataset is not None else cfg["dataset"]
-        chosen_k = _choose_k(k, cfg["k"])
-        thresholds = parse_fail_under(fail_under) if fail_under else cfg["thresholds"]
+        cutoffs = _choose_cutoffs(k, k_values, cfg["k"], cfg["k_values"])
+        parsed_thresholds = parse_fail_under(fail_under) if fail_under else cfg["thresholds"]
+        bound_thresholds = bind_thresholds(parsed_thresholds, cutoffs)
         tag_thresholds = (
             parse_fail_under_tag(fail_under_tag) if fail_under_tag else cfg["tag_thresholds"]
         )
@@ -214,8 +228,8 @@ def run(
         chosen_drop = _choose_max_drop(max_drop, cfg["max_drop"], chosen_baseline)
         if chosen_dataset is None:
             raise ConfigError("pass --dataset or set dataset in --config")
-        if chosen_k < 1:
-            raise ConfigError("k must be >= 1")
+        chosen_k = cutoffs[-1]
+        multi = len(cutoffs) > 1
         fn, retriever_name, request_concurrency = _prepare_retriever(
             retriever,
             retriever_url,
@@ -235,9 +249,11 @@ def run(
             chosen_k,
             dataset=str(chosen_dataset),
             retriever_name=retriever_name,
-            thresholds=thresholds,
+            thresholds=bound_thresholds[chosen_k],
             tag_thresholds=tag_thresholds,
             concurrency=request_concurrency,
+            k_values=cutoffs if multi else None,
+            thresholds_by_k=bound_thresholds if multi else None,
         )
         baseline_report = (
             load_report(chosen_baseline) if chosen_baseline is not None else None
@@ -417,27 +433,101 @@ def compare(
         raise typer.Exit(code=1)
 
 
-def parse_fail_under(items: list[str]) -> dict[str, float]:
-    """Parse repeated ``name=value`` thresholds.
+def parse_fail_under(items: list[str]) -> dict[str, dict[int | None, float]]:
+    """Parse repeated ``name=value`` or ``name@k=value`` thresholds.
 
-    Names are hit_rate, recall, precision, mrr, and ndcg. The value is
-    the minimum allowed aggregate, from 0 to 1 inclusive.
+    Names are hit_rate, recall, precision, mrr, and ndcg. A bare name is
+    stored under cutoff ``None`` and later bound to the largest k. The
+    value is the minimum allowed aggregate, from 0 to 1 inclusive.
     """
 
     allowed = set(METRIC_NAMES)
-    thresholds: dict[str, float] = {}
+    thresholds: dict[str, dict[int | None, float]] = {}
     for item in items:
         if "=" not in item:
             raise ConfigError(f"--fail-under {item!r} must look like name=value")
         name, raw = item.split("=", 1)
         name = name.strip()
-        if name not in allowed:
+        metric, cutoff = _split_metric_cutoff(name)
+        if metric not in allowed:
             names = ", ".join(METRIC_NAMES)
-            raise ConfigError(f"unknown metric {name!r} in --fail-under (expected {names})")
-        if name in thresholds:
-            raise ConfigError(f"--fail-under metric {name!r} was given twice")
-        thresholds[name] = _threshold_value("--fail-under", item, name, raw)
+            raise ConfigError(f"unknown metric {metric!r} in --fail-under (expected {names})")
+        limits = thresholds.setdefault(metric, {})
+        if cutoff in limits:
+            label = metric if cutoff is None else f"{metric}@{cutoff}"
+            raise ConfigError(f"--fail-under metric {label!r} was given twice")
+        limits[cutoff] = _threshold_value("--fail-under", item, metric, raw)
     return thresholds
+
+
+def bind_thresholds(
+    parsed: dict[str, dict[int | None, float]],
+    cutoffs: list[int],
+) -> dict[int, dict[str, float]]:
+    """Attach each threshold to a cutoff that this run scores.
+
+    A bare metric name uses the largest cutoff. ``name@k`` has to name one
+    of ``cutoffs``. The same metric at the same cutoff is an error, including
+    a bare name together with ``name@k`` when that k is the largest.
+    """
+
+    largest = cutoffs[-1]
+    allowed = set(cutoffs)
+    bound: dict[int, dict[str, float]] = {cutoff: {} for cutoff in cutoffs}
+    for metric, limits in parsed.items():
+        for cutoff, value in limits.items():
+            target = largest if cutoff is None else cutoff
+            if target not in allowed:
+                shown = ", ".join(str(item) for item in cutoffs)
+                label = metric if cutoff is None else f"{metric}@{cutoff}"
+                raise ConfigError(f"--fail-under {label} does not match a cutoff ({shown})")
+            if metric in bound[target]:
+                raise ConfigError(
+                    f"--fail-under metric {metric!r} was given twice for k={target}"
+                )
+            bound[target][metric] = value
+    return bound
+
+
+def parse_k_values(text: str, *, label: str = "--k-values") -> list[int]:
+    """Parse ``1,3,5,10`` into ascending cutoffs.
+
+    Duplicates are an error. Values are sorted so the last one is what the
+    retriever is called with.
+    """
+
+    if not isinstance(text, str) or not text.strip():
+        raise ConfigError(
+            f"{label} must be a comma-separated list of integers >= 1, like 1,3,5,10"
+        )
+    parts = [part.strip() for part in text.split(",")]
+    if any(not part for part in parts):
+        raise ConfigError(
+            f"{label} must be a comma-separated list of integers >= 1, like 1,3,5,10"
+        )
+    values = []
+    for part in parts:
+        if not re.fullmatch(r"[0-9]+", part):
+            raise ConfigError(f"{label} entry {part!r} is not an integer >= 1")
+        value = int(part)
+        if value < 1:
+            raise ConfigError(f"{label} entry {part!r} is not an integer >= 1")
+        values.append(value)
+    if len(values) != len(set(values)):
+        raise ConfigError(f"{label} contains a duplicate")
+    return sorted(values)
+
+
+def _split_metric_cutoff(name: str) -> tuple[str, int | None]:
+    metric, sep, raw_k = name.partition("@")
+    if not sep:
+        return metric, None
+    if not re.fullmatch(r"[0-9]+", raw_k):
+        return name, None
+    cutoff = int(raw_k)
+    if cutoff < 1:
+        raise ConfigError(f"--fail-under cutoff in {name!r} must be >= 1")
+    return metric, cutoff
 
 
 def parse_fail_under_tag(items: list[str]) -> dict[str, dict[str, float]]:
@@ -595,7 +685,10 @@ def load_config(path: Path) -> dict:
     Paths are resolved relative to the config file. ``fail_under`` may be
     a mapping of metric name to limit, or a list of ``name=value`` strings.
     ``fail_under_tag`` may be a mapping of tag to metric limits, or a list
-    of ``tag:metric=value`` strings.     ``retriever_url`` calls an HTTP
+    of ``tag:metric=value`` strings. A ``fail_under`` metric may be
+    ``recall`` or ``recall@5``. ``k_values`` is a list of cutoffs or the
+    same comma-separated text as ``--k-values``. Set ``k`` or ``k_values``,
+    not both. ``retriever_url`` calls an HTTP
     service. ``method``, ``headers``, ``timeout``, ``concurrency``,
     and ``results_key`` apply to that service. ``id_field`` applies to
     the service and to a LangChain or LlamaIndex retriever. ``adapter``
@@ -630,6 +723,7 @@ def load_config(path: Path) -> dict:
         "id_field": _config_text(path, raw.get("id_field"), "id_field"),
         "adapter": _config_adapter(path, raw.get("adapter")),
         "k": _config_k(path, raw.get("k")),
+        "k_values": _config_k_values(path, raw.get("k_values")),
         "baseline": _config_path(path, raw.get("baseline"), "baseline"),
         "max_drop": _config_max_drop(path, raw.get("max_drop")),
         "thresholds": _config_thresholds(path, raw.get("fail_under")),
@@ -650,6 +744,7 @@ def _empty_config() -> dict:
         "id_field": None,
         "adapter": None,
         "k": None,
+        "k_values": None,
         "baseline": None,
         "max_drop": None,
         "thresholds": {},
@@ -657,12 +752,36 @@ def _empty_config() -> dict:
     }
 
 
-def _choose_k(flag: int | None, configured: int | None) -> int:
-    if flag is not None:
-        return flag
-    if configured is not None:
-        return configured
-    return 5
+def _choose_cutoffs(
+    k_flag: int | None,
+    k_values_flag: str | None,
+    configured_k: int | None,
+    configured_k_values: list[int] | None,
+) -> list[int]:
+    """Pick the cutoffs for this run.
+
+    ``--k`` and ``--k-values`` together are an error. A flag replaces both
+    config keys. A config file that sets both ``k`` and ``k_values`` is an
+    error when neither flag is set. The default is a single cutoff of 5.
+    """
+
+    if k_flag is not None and k_values_flag is not None:
+        raise ConfigError("pass --k or --k-values, not both")
+    if k_values_flag is not None:
+        return parse_k_values(k_values_flag)
+    if k_flag is not None:
+        if isinstance(k_flag, bool) or not isinstance(k_flag, int) or k_flag < 1:
+            raise ConfigError("k must be >= 1")
+        return [k_flag]
+    if configured_k is not None and configured_k_values is not None:
+        raise ConfigError("config sets both k and k_values")
+    if configured_k_values is not None:
+        return list(configured_k_values)
+    if configured_k is not None:
+        if configured_k < 1:
+            raise ConfigError("k must be >= 1")
+        return [configured_k]
+    return [5]
 
 
 def _choose_max_drop(
@@ -764,6 +883,26 @@ def _config_k(path: Path, value: object) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ConfigError(f"{path}: k must be an integer >= 1")
     return value
+
+
+def _config_k_values(path: Path, value: object) -> list[int] | None:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, str):
+            return parse_k_values(value, label="k_values")
+        if isinstance(value, list):
+            if not value:
+                raise ConfigError("k_values must list at least one integer")
+            rendered = []
+            for item in value:
+                if isinstance(item, bool) or not isinstance(item, int):
+                    raise ConfigError("k_values entries must be integers >= 1")
+                rendered.append(str(item))
+            return parse_k_values(",".join(rendered), label="k_values")
+        raise ConfigError("k_values must be a list of integers or a comma-separated string")
+    except ConfigError as exc:
+        raise ConfigError(f"{path}: {exc}") from exc
 
 
 def _config_max_drop(path: Path, value: object) -> float | None:

@@ -788,6 +788,36 @@ def test_concurrency_stays_at_the_limit(base_url):
     assert report["metrics"]["hit_rate"] == 1
 
 
+def test_k_values_requests_the_largest_k_once(tmp_path, base_url):
+    dataset = tmp_path / "cases.jsonl"
+    _write_cases(dataset, '{"id": "q1", "query": "cats", "relevant": ["d1", "d2"]}\n')
+    report_path = tmp_path / "report.json"
+    result = _run(
+        [
+            "run",
+            "--dataset",
+            str(dataset),
+            "--retriever-url",
+            f"{base_url}/search",
+            "--k-values",
+            "1,3",
+            "--json",
+            str(report_path),
+        ]
+    )
+    assert result.exit_code == 0, _output(result)
+    assert len(_state.requests) == 1
+    assert json.loads(_state.requests[0]["body"]) == {"query": "cats", "k": 3}
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["k"] == 3
+    assert report["results"][0]["retrieved"] == ["d1", "d2"]
+    # The service returns two ids. k=1 keeps the first. k=3 still has only those two.
+    assert report["cutoffs"][0]["metrics"]["recall"] == 0.5
+    assert report["cutoffs"][0]["metrics"]["precision"] == 1.0
+    assert report["cutoffs"][1]["metrics"]["recall"] == 1.0
+    assert report["cutoffs"][1]["metrics"]["precision"] == round(2 / 3, 6)
+
+
 def test_example_fastapi_service_wraps_bm25():
     pytest.importorskip("fastapi")
     from examples.fastapi_service import SearchRequest, search_get, search_post

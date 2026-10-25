@@ -205,7 +205,7 @@ The checked-in files are `examples/cases.jsonl` and `examples/cases.yaml`.
 
 ## Metrics
 
-Scores use the cutoff `--k`. The ranking is the first k unique document ids, in the order returned. A repeated id does not take another rank slot. If that leaves fewer than k ids, the missing positions count as not relevant.
+Scores use the cutoff `--k`. Pass `--k-values` to score several cutoffs from one retrieval. See Several cutoffs. The ranking is the first k unique document ids, in the order returned. A repeated id does not take another rank slot. If that leaves fewer than k ids, the missing positions count as not relevant.
 
 Hit rate, recall, precision, and MRR treat a document as relevant when its grade is greater than 0. nDCG uses the numeric grade. Binary labels are grade 1. The number in the report is the unweighted mean across cases. If any case has tags, a second table lists each tag, how many cases carry it, and the same five scores. A tag score is the unweighted mean of the cases with that tag. A case with two tags counts in both. Cases with no tags stay out of that table. Tags are listed alphabetically.
 
@@ -220,6 +220,57 @@ Threshold names are `hit_rate`, `recall`, `precision`, `mrr`, and `ndcg`. A scor
 - **nDCG.** Normalized discounted cumulative gain. Gain at 1-based rank i is `(2 ** grade - 1) / log2(i + 1)`. The ideal ranking sorts the case grades descending and keeps at most k of them. nDCG is 0 when no relevant document was retrieved.
 
 The report then lists up to 10 cases that missed at least one relevant id, lowest recall first. The JSON report has every case, including the retrieved ids and the misses. When cases have tags, it also has a `tags` list with each tag's case count and scores.
+
+## Several cutoffs
+
+`--k-values 1,3,5,10` scores every cutoff in one run. The retriever is called once per query, at the largest value, and each smaller cutoff is the prefix of that list. Duplicate ids still take one slot, and a short list still divides precision by k. The values are sorted. A duplicate, or a value below 1, is an error. `--k` and `--k-values` together exit 2. A config file that sets both `k` and `k_values` does the same when neither flag is passed. Either flag replaces both config keys.
+
+`recall@5=0.8` gates recall at that cutoff, which has to be one of the values being scored. A bare `recall=0.8` applies to the largest. On a single-k run, `recall@5` with `--k 5` is the same gate as a bare `recall`. Tag gates do not take `@k`. The tag table, the worst misses, the per-case rows, and a bootstrap all use the largest k. The text report says so in those headings.
+
+JSON keeps the old top-level shape. `k`, `metrics`, `thresholds`, `failed`, `results`, and `tags` are the largest cutoff, so a single-k file still loads as a baseline. `k_values` and `cutoffs` are added only when there is more than one cutoff. A failure at a smaller cutoff is `recall@5` in `failed`. A failure at the largest stays `recall`. In a config file the key is `k_values`, a list or the same comma-separated text. The action input is `k-values`.
+
+When both reports have `cutoffs`, compare prints a delta at every shared k and fails if any of those drops by more than `--max-drop`. A cutoff present on only one side is listed and does not fail. When only one report has `cutoffs`, compare uses the other report's `k` if that cutoff was scored. If it was not, or that report has no `k`, the command says the metrics were not compared and does not fail the metric check. Tag deltas and worse cases still use the stored scores, which are each report's largest k.
+
+```bash
+retrieval-gate run \
+  --dataset examples/cases.jsonl \
+  --retriever examples.retriever:retrieve \
+  --k-values 1,3,5,10 \
+  --fail-under recall@5=0.8 \
+  --fail-under mrr=0.6
+```
+
+That prints:
+
+```
+dataset: examples/cases.jsonl
+retriever: examples.retriever:retrieve
+k: 1, 3, 5, 10
+cases: 10
+
+metric     @1      @3      @5      @10
+---------  ------  ------  ------  ------
+hit_rate   1.0000  1.0000  1.0000  1.0000
+recall     0.9500  1.0000  1.0000  1.0000
+precision  1.0000  0.3667  0.2200  0.1100
+mrr        1.0000  1.0000  1.0000  1.0000
+ndcg       1.0000  0.9964  0.9964  0.9964
+
+thresholds
+metric  k   threshold  score   status
+------  --  ---------  ------  ------
+recall  5   0.8000     1.0000  pass
+mrr     10  0.6000     1.0000  pass
+
+tags at k=10
+tag      cases  hit_rate  recall  precision  mrr     ndcg
+-------  -----  --------  ------  ---------  ------  ------
+api      2      1.0000    1.0000  0.1500     1.0000  0.9820
+billing  3      1.0000    1.0000  0.1333     1.0000  0.9880
+
+worst misses at k=10
+none
+```
 
 ## Compare and CI
 

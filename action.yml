@@ -8,7 +8,7 @@ inputs:
     description: >
       Path to a YAML config. Keys are dataset, retriever, retriever_url,
       adapter, method, headers, timeout, concurrency, results_key, id_field, k,
-      fail_under, fail_under_tag, baseline, and max_drop. Paths inside
+      k_values, fail_under, fail_under_tag, baseline, and max_drop. Paths inside
       the file are relative to the file.
     required: false
     default: ""
@@ -30,9 +30,16 @@ inputs:
     description: Number of unique results to score per query. Overrides config. Defaults to 5.
     required: false
     default: ""
+  k-values:
+    description: >
+      Comma-separated cutoffs, for example "1,3,5,10". The retriever is
+      called once at the largest value. Overrides config. Do not set with k.
+    required: false
+    default: ""
   fail-under:
     description: >
-      Space-separated thresholds, for example "recall=0.8 mrr=0.6".
+      Space-separated thresholds, for example "recall=0.8 mrr=0.6" or
+      "recall@5=0.8". A bare name applies to the largest cutoff.
       Overrides config when set.
     required: false
     default: ""
@@ -74,6 +81,7 @@ runs:
         RG_BASELINE: ${{ inputs.baseline }}
         RG_RETRIEVER: ${{ inputs.retriever }}
         RG_K: ${{ inputs.k }}
+        RG_K_VALUES: ${{ inputs.k-values }}
         RG_FAIL_UNDER: ${{ inputs.fail-under }}
         RG_MAX_DROP: ${{ inputs.max-drop }}
       run: |
@@ -91,6 +99,9 @@ runs:
         fi
         if [[ -n "$RG_K" ]]; then
           cmd+=(--k "$RG_K")
+        fi
+        if [[ -n "$RG_K_VALUES" ]]; then
+          cmd+=(--k-values "$RG_K_VALUES")
         fi
         if [[ -n "$RG_BASELINE" ]]; then
           cmd+=(--baseline "$RG_BASELINE")

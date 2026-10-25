@@ -542,3 +542,87 @@ def test_config_adapter_and_id_field(tmp_path):
     url = runner.invoke(app, ["run", "--config", str(config)])
     assert url.exit_code == 2
     assert "adapter requires a retriever import path" in _output(url)
+
+
+def test_langchain_k_values_searches_once_at_the_largest_k():
+    store = _store(
+        Document(id="d1", page_content="cats"),
+        Document(id="d2", page_content="cats"),
+        Document(id="d3", page_content="cats"),
+    )
+    seen: list[int] = []
+    real = store.asimilarity_search
+
+    async def spy(query: str, k: int = 4, **kwargs):
+        seen.append(k)
+        return await real(query, k=k, **kwargs)
+
+    store.asimilarity_search = spy
+    fn = adapt_retriever(store, label="app:store")
+    case = Case.model_validate({"id": "q1", "query": "cats", "relevant": ["d1"]})
+    report = build_report(
+        [case],
+        fn,
+        3,
+        dataset="cases.jsonl",
+        retriever_name="app:store",
+        thresholds={},
+        k_values=[1, 3],
+    )
+    assert seen == [3]
+    assert report["k"] == 3
+    assert [row["k"] for row in report["cutoffs"]] == [1, 3]
+    retrieved = report["results"][0]["retrieved"]
+    assert len(retrieved) == 3
+    hit = 1.0 if retrieved[0] == "d1" else 0.0
+    assert report["cutoffs"][0]["metrics"]["hit_rate"] == hit
+    assert report["cutoffs"][1]["metrics"]["precision"] == round(1 / 3, 6)
+
+
+def test_llamaindex_k_values_sets_top_k_once():
+    index = _index(*(TextNode(text=f"doc {i}", id_=f"d{i}") for i in range(1, 5)))
+    retriever = index.as_retriever(similarity_top_k=2)
+    seen: list[tuple[str, int]] = []
+    real = retriever.aretrieve
+
+    async def spy(query: str):
+        seen.append(("aretrieve", retriever.similarity_top_k))
+        return await real(query)
+
+    retriever.aretrieve = spy
+    fn = adapt_retriever(retriever, adapter="llamaindex", label="app:retriever")
+    case = Case.model_validate({"id": "q1", "query": "doc", "relevant": ["d1"]})
+    report = build_report(
+        [case],
+        fn,
+        4,
+        dataset="cases.jsonl",
+        retriever_name="app:retriever",
+        thresholds={},
+        k_values=[1, 4],
+    )
+    assert seen == [("aretrieve", 4)]
+    assert retriever.similarity_top_k == 2
+    assert report["k"] == 4
+    assert [row["k"] for row in report["cutoffs"]] == [1, 4]
+    assert len(report["results"][0]["retrieved"]) == 4
+
+
+def test_llamaindex_fixed_list_is_scored_at_each_cutoff():
+    fn = adapt_retriever(_LlamaFixed(), label="app:retriever")
+    case = Case.model_validate({"id": "q1", "query": "q", "relevant": ["d1"]})
+    report = build_report(
+        [case],
+        fn,
+        3,
+        dataset="cases.jsonl",
+        retriever_name="app:retriever",
+        thresholds={"precision": 0.5},
+        k_values=[1, 3],
+        thresholds_by_k={1: {}, 3: {"precision": 0.5}},
+    )
+    assert report["results"][0]["retrieved"] == ["d1", "d2", "d3"]
+    assert report["cutoffs"][0]["metrics"]["precision"] == 1.0
+    assert report["cutoffs"][0]["metrics"]["recall"] == 1.0
+    assert report["cutoffs"][1]["metrics"]["precision"] == round(1 / 3, 6)
+    assert report["failed"] == ["precision"]
