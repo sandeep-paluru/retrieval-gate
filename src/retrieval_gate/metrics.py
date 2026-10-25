@@ -129,6 +129,23 @@ def score_case(retrieved: list[str], grades: dict[str, int], k: int) -> dict[str
     }
 
 
+def score_at_cutoffs(
+    retrieved: list[str],
+    grades: dict[str, int],
+    ks: list[int],
+) -> dict[int, dict[str, float]]:
+    """Score one retrieved list at each cutoff.
+
+    ``retrieved`` is the list returned for the largest k. Each cutoff keeps
+    the first k unique ids of that same list. A repeated id does not take
+    another slot, and a short list leaves the missing positions empty.
+    """
+
+    if not ks:
+        raise ValueError("k values are empty")
+    return {cutoff: score_case(retrieved, grades, cutoff) for cutoff in ks}
+
+
 def _dcg(grades) -> float:
     total = 0.0
     for rank, grade in enumerate(grades, start=1):
