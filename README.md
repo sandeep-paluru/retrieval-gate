@@ -76,6 +76,48 @@ retrieval-gate run \
 
 The callable is `(query: str, k: int)`. It can be sync or async. Return a list of document id strings, or a list of dicts or objects with an `id` field. A LangChain or LlamaIndex retriever is accepted too. See LangChain and LlamaIndex.
 
+## pytest
+
+Installing the package registers a pytest plugin. Pytest loads it. A test that does not use the `retrieval_gate` fixture does not score anything.
+
+```python
+def test_search(retrieval_gate):
+    result = retrieval_gate(
+        "tests/retrieval/cases.jsonl",
+        "myapp.search:retrieve",
+        k=10,
+    )
+    result.assert_scores(recall=0.8, mrr=0.6)
+```
+
+The retriever is an import path, a `(query, k)` callable, or a LangChain or LlamaIndex retriever. Scoring is the same code as `retrieval-gate run`. `k` defaults to 5. Leave it out to use `k` or `k_values` from the config file.
+
+`assert_scores` fails the test when a score is below its threshold. The message lists each failing metric, the score, and the threshold, then the worst misses. A score equal to the threshold passes. Keyword arguments override the same metric from the config. Other configured thresholds still apply.
+
+```bash
+pytest --retrieval-gate-config tests/retrieval/gate.yml
+```
+
+```python
+def test_search(retrieval_gate):
+    result = retrieval_gate(
+        "tests/retrieval/cases.jsonl",
+        "myapp.search:retrieve",
+    )
+    result.assert_scores()
+```
+
+With no arguments, `assert_scores` uses `fail_under`, `fail_under_tag`, and `max_latency` from that file. `retrieval_gate_config` in `pytest.ini` or `pyproject.toml` sets the same path. `--retrieval-gate-config` overrides it. `@pytest.mark.retrieval_gate(config="tests/retrieval/gate.yml")` sets it for one test.
+
+A `baseline` in the config is not compared. Write the JSON report and run `compare`:
+
+```bash
+pytest --retrieval-gate-json report.json
+retrieval-gate compare tests/retrieval/baseline.json report.json
+```
+
+The file matches `retrieval-gate run --json`. `retrieval_gate_json` in the pytest config sets the same path. If several tests call the fixture, the last call overwrites the file.
+
 ## HTTP retriever
 
 `--retriever-url` scores a search service. The import path stays local and still makes no network call. Pass one of the two, not both.

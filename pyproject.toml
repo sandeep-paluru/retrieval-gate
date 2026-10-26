@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "retrieval-gate"
-version = "0.6.0"
+version = "0.7.0"
 description = "Score a retriever against labeled queries and fail CI when metrics drop."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -35,6 +35,9 @@ llamaindex = [
 
 [project.scripts]
 retrieval-gate = "retrieval_gate.cli:main"
+
+[project.entry-points.pytest11]
+retrieval_gate = "retrieval_gate.pytest_plugin"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/retrieval_gate"]
